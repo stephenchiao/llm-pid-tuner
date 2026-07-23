@@ -23,6 +23,21 @@ DEFAULT_PID_LIMITS: Dict[str, Dict[str, float]] = {
     "d": {"min": 0.0, "max":  20.0, "max_increase_ratio": 4.0},
 }
 
+HARDWARE_PID_LIMITS: Dict[str, Dict[str, float]] = {
+    # STM32F407 麦克纳姆底盘 Y 轴位置环：误差单位 mm，输出单位 m/s。
+    # 固件当前采用 20 ms 离散位置式 PID，I/D 参数也是离散域增益。
+    "p": {"min": 0.0, "max": 0.005,   "max_increase_ratio": 1.5},
+    "i": {"min": 0.0, "max": 0.00005, "max_increase_ratio": 1.5},
+    "d": {"min": 0.0, "max": 0.002,   "max_increase_ratio": 1.5},
+}
+
+HARDWARE_YAW_PID_LIMITS: Dict[str, Dict[str, float]] = {
+    # 航向误差单位 degree，输出单位 rad/s，不能复用毫米位置环的增益范围。
+    "p": {"min": 0.0, "max": 0.05,    "max_increase_ratio": 1.5},
+    "i": {"min": 0.0, "max": 0.00010, "max_increase_ratio": 1.5},
+    "d": {"min": 0.0, "max": 0.02,    "max_increase_ratio": 1.5},
+}
+
 PYTHON_SIM_PID_LIMITS: Dict[str, Dict[str, float]] = {
     "p": {"min": 0.0, "max": 5000.0, "max_increase_ratio": 3.0},
     "i": {"min": 0.0, "max":  500.0, "max_increase_ratio": 4.0},
@@ -36,9 +51,9 @@ SIMULINK_PID_LIMITS: Dict[str, Dict[str, float]] = {
 }
 
 DEFAULT_CONVERGENCE_RULES: Dict[str, float] = {
-    "avg_error_threshold"         : 1.2,
-    "steady_state_error_threshold": 0.3,
-    "overshoot_threshold"         : 2.0,
+    "avg_error_threshold"         : 80.0,
+    "steady_state_error_threshold": 10.0,
+    "overshoot_threshold"         : 3.0,
 }
 
 DEFAULT_ROLLBACK_RULES: Dict[str, float] = {
@@ -56,6 +71,10 @@ def get_pid_limits(mode: str | None = None) -> Dict[str, Dict[str, float]]:
         source = PYTHON_SIM_PID_LIMITS
     elif normalized == "simulink":
         source = SIMULINK_PID_LIMITS
+    elif normalized == "hardware_yaw":
+        source = HARDWARE_YAW_PID_LIMITS
+    elif normalized == "hardware":
+        source = HARDWARE_PID_LIMITS
     else:
         source = DEFAULT_PID_LIMITS
 

@@ -26,3 +26,4 @@ result.json
 
 # Local artifacts
 artifacts/
+logs/

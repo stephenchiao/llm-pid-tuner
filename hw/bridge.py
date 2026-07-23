@@ -99,7 +99,8 @@ class SerialBridge:
                     print(f"[INFO] Connected to virtual hardware feed: {DEMO_SERIAL_PORT}")
                 return True
 
-            self.serial = serial.Serial(self.port, self.baudrate, timeout=1)
+            # Short reads keep the 0.5 s host heartbeat and safety timeout responsive.
+            self.serial = serial.Serial(self.port, self.baudrate, timeout=0.2)
             self.last_error = ""
             if self.emit_console:
                 print(f"[INFO] Connected to {self.port}")
@@ -135,6 +136,25 @@ class SerialBridge:
                 if self.emit_console:
                     print(f"[ERROR] Failed to send command '{cmd}': {e}")
 
+    def send_silent_command(self, cmd: str) -> None:
+        """Send watchdog traffic without flooding the console/TUI."""
+        if self.serial and self.serial.is_open:
+            try:
+                self.serial.write(f"{cmd}\n".encode("utf-8"))
+                self.last_error = ""
+            except Exception as e:
+                self.last_error = str(e)
+
+    def clear_input_buffer(self) -> None:
+        """Discard replies left from the completed hardware round."""
+        if self.serial and self.serial.is_open:
+            try:
+                reset_input = getattr(self.serial, "reset_input_buffer", None)
+                if callable(reset_input):
+                    reset_input()
+            except Exception as e:
+                self.last_error = str(e)
+
     def parse_data(self, line: str):
         if not line or line.startswith("#"):
             return None
@@ -150,6 +170,15 @@ class SerialBridge:
                     "p": float(parts[5]) if len(parts) > 5 else 1.0,
                     "i": float(parts[6]) if len(parts) > 6 else 0.1,
                     "d": float(parts[7]) if len(parts) > 7 else 0.05,
+                    "x": float(parts[8]) if len(parts) > 8 else None,
+                    "y": float(parts[9]) if len(parts) > 9 else None,
+                    "yaw": float(parts[10]) if len(parts) > 10 else None,
+                    "cross_track": float(parts[11]) if len(parts) > 11 else None,
+                    "yaw_delta": float(parts[12]) if len(parts) > 12 else None,
+                    "hold_cross_output": float(parts[13]) if len(parts) > 13 else None,
+                    "hold_yaw_output": float(parts[14]) if len(parts) > 14 else None,
+                    "center_x": float(parts[15]) if len(parts) > 15 else None,
+                    "center_y": float(parts[16]) if len(parts) > 16 else None,
                 }
             except Exception:
                 pass

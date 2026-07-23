@@ -11,6 +11,23 @@ from hw.bridge import DEMO_SERIAL_PORT, SerialBridge, select_serial_port
 
 
 class DemoSerialBridgeTests(unittest.TestCase):
+    def test_parse_extended_hardware_csv_pose_fields(self):
+        bridge = SerialBridge("COM9", 115200, emit_console=False)
+        data = bridge.parse_data(
+            "20,200,4,0.004,196,0.004,0,0,12.5,34.5,-179.0,"
+            "8.7,0.41,-0.0287,-0.0082,12.06,59.50"
+        )
+
+        self.assertEqual(data["x"], 12.5)
+        self.assertEqual(data["y"], 34.5)
+        self.assertEqual(data["yaw"], -179.0)
+        self.assertEqual(data["cross_track"], 8.7)
+        self.assertEqual(data["yaw_delta"], 0.41)
+        self.assertEqual(data["hold_cross_output"], -0.0287)
+        self.assertEqual(data["hold_yaw_output"], -0.0082)
+        self.assertEqual(data["center_x"], 12.06)
+        self.assertEqual(data["center_y"], 59.50)
+
     def test_demo_port_streams_parseable_hardware_data(self):
         bridge = SerialBridge(DEMO_SERIAL_PORT, 115200, emit_console=False)
 

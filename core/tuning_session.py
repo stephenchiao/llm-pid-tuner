@@ -62,8 +62,11 @@ def create_tuning_session(
     initial_pid: dict[str, float] | None = None,
     setpoint: float | None = None,
     max_history: int = 5,
+    buffer_size: int | None = None,
 ) -> TuningSessionState:
-    buffer = AdvancedDataBuffer(max_size=CONFIG["BUFFER_SIZE"])
+    buffer = AdvancedDataBuffer(
+        max_size=int(buffer_size if buffer_size is not None else CONFIG["BUFFER_SIZE"])
+    )
     if initial_pid is not None:
         buffer.current_pid = dict(initial_pid)
     if setpoint is not None:
@@ -179,6 +182,7 @@ def finalize_decision(
     result: dict[str, Any] | None,
     *,
     limits: dict[str, dict[str, float]] | None = None,
+    freeze_integral: bool = False,
 ) -> DecisionOutcome:
     if not result:
         result = build_fallback_suggestion(
@@ -192,6 +196,9 @@ def finalize_decision(
         result,
         limits=limits,
     )
+    if freeze_integral and safe_pid["i"] > evaluation.current_pid["i"]:
+        safe_pid["i"] = evaluation.current_pid["i"]
+        guardrail_notes.append("输出持续饱和，本轮冻结 I，禁止继续增加积分")
     analysis = str(result.get("analysis_summary", "No analysis summary was provided."))
     thought = str(result.get("thought_process", ""))
     action = str(result.get("tuning_action", "UNKNOWN"))

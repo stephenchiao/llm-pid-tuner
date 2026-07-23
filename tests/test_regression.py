@@ -295,6 +295,37 @@ class PromptSelectionTests(unittest.TestCase):
 
 
 class TuningSessionHistoryTests(unittest.TestCase):
+    def test_finalize_decision_freezes_integral_when_output_is_saturated(self):
+        state = create_tuning_session(
+            initial_pid={"p": 0.004, "i": 0.0, "d": 0.0},
+            setpoint=200.0,
+        )
+        evaluation = RoundEvaluation(
+            round_index=1,
+            metrics={"avg_error": 80.0, "steady_state_error": 20.0, "overshoot": 0.0, "status": "SLOW_RESPONSE"},
+            current_pid={"p": 0.004, "i": 0.0, "d": 0.0},
+            stable_rounds=0,
+        )
+
+        decision = finalize_decision(
+            state,
+            evaluation,
+            {
+                "analysis_summary": "Add integral.",
+                "thought_process": "Output is saturated.",
+                "tuning_action": "ADJUST_PID",
+                "p": 0.004,
+                "i": 0.00001,
+                "d": 0.0,
+                "status": "TUNING",
+            },
+            limits=get_pid_limits("hardware"),
+            freeze_integral=True,
+        )
+
+        self.assertEqual(decision.safe_pid["i"], 0.0)
+        self.assertIn("冻结 I", "; ".join(decision.guardrail_notes))
+
     def test_finalize_decision_records_pid_that_generated_metrics(self):
         state = create_tuning_session(
             initial_pid={"p": 1.0, "i": 0.0, "d": 0.0},
