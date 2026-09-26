@@ -79,14 +79,12 @@ class ConfigLoadTests(unittest.TestCase):
 
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
-                os.chdir(temp_dir)
+                temp_config = Path(temp_dir) / "config.json"
                 core_config.CONFIG.clear()
                 core_config.CONFIG.update(DEFAULT_CONFIG)
-                core_config.load_config(create_if_missing=True, verbose=False)
-                generated = json.loads(
-                    Path("config.json").read_text(encoding="utf-8")
-                )
-                os.chdir(original_cwd)
+                with patch.object(core_config, "CONFIG_PATH", temp_config):
+                    core_config.load_config(create_if_missing=True, verbose=False)
+                    generated = json.loads(temp_config.read_text(encoding="utf-8"))
         finally:
             os.chdir(original_cwd)
             core_config.CONFIG.clear()
@@ -103,8 +101,8 @@ class ConfigLoadTests(unittest.TestCase):
 
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
-                os.chdir(temp_dir)
-                Path("config.json").write_text(
+                temp_config = Path(temp_dir) / "config.json"
+                temp_config.write_text(
                     json.dumps(
                         {
                             "LLM_API_BASE_URL": "http://127.0.0.1:8000/v1",
@@ -113,10 +111,10 @@ class ConfigLoadTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-                core_config.load_config(create_if_missing=False, verbose=False)
-                loaded_base_url = imported_config["LLM_API_BASE_URL"]
-                loaded_model_name = imported_config["LLM_MODEL_NAME"]
-                os.chdir(original_cwd)
+                with patch.object(core_config, "CONFIG_PATH", temp_config):
+                    core_config.load_config(create_if_missing=False, verbose=False)
+                    loaded_base_url = imported_config["LLM_API_BASE_URL"]
+                    loaded_model_name = imported_config["LLM_MODEL_NAME"]
         finally:
             os.chdir(original_cwd)
             core_config.CONFIG.clear()
@@ -125,6 +123,18 @@ class ConfigLoadTests(unittest.TestCase):
         self.assertIs(imported_config, core_config.CONFIG)
         self.assertEqual(loaded_base_url, "http://127.0.0.1:8000/v1")
         self.assertEqual(loaded_model_name, "demo-model")
+
+    def test_config_path_is_independent_of_working_directory(self):
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            try:
+                os.chdir(temp_dir)
+                self.assertEqual(
+                    core_config.CONFIG_PATH,
+                    Path(core_config.__file__).resolve().parent.parent / "config.json",
+                )
+            finally:
+                os.chdir(original_cwd)
 
 
 class LLMFallbackTests(unittest.TestCase):
@@ -151,6 +161,27 @@ class LLMFallbackTests(unittest.TestCase):
         result = tuner._parse_json(raw)
         self.assertIsNotNone(result)
         self.assertNotIn("p", result)  # type: ignore[operator]
+
+    def test_summarize_tuning_session_parses_brief_json(self):
+        tuner = self._make_tuner_without_sdk()
+        response = json.dumps(
+            {
+                "process_summary": "逐步调整P并完成重复验证。",
+                "evaluation": "最终响应稳定且超调较小。",
+                "recommendation": "继续进行带载复验。",
+            },
+            ensure_ascii=False,
+        )
+        with patch.object(tuner, "_call_with_retry", return_value=response):
+            summary = tuner.summarize_tuning_session(
+                {
+                    "tune_axis": "X",
+                    "final_pid": {"p": 0.0033, "i": 0.0, "d": 0.0},
+                }
+            )
+
+        self.assertEqual(summary["source"], "llm")
+        self.assertIn("重复验证", summary["process_summary"])
 
     def test_provider_resolution_openai(self):
         tuner = self._make_tuner_without_sdk("openai")

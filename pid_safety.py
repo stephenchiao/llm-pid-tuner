@@ -14,6 +14,8 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List, Tuple
 
+from core.config import CONFIG
+
 
 PID_KEYS = ("p", "i", "d")
 
@@ -129,6 +131,41 @@ def apply_pid_guardrails(
     return sanitized, notes
 
 
+def apply_yaw_guardrails(
+    current_yaw_pid: Dict[str, float],
+    candidate: Dict[str, Any],
+    *,
+    max_increase_ratio: float = 1.2,
+) -> Tuple[Dict[str, float], List[str]]:
+    """X/Y 调参时对 YAW hold 环做更严的单轮步长限制。"""
+    limits = get_pid_limits("hardware_yaw")
+    for key in PID_KEYS:
+        limits[key]["max_increase_ratio"] = max(1.0, float(max_increase_ratio))
+    return apply_pid_guardrails(current_yaw_pid, candidate, limits=limits)
+
+
+def extract_yaw_pid(payload: Dict[str, Any], current_yaw_pid: Dict[str, float]) -> Dict[str, float]:
+    """从 LLM 结果中取出 yaw_p/yaw_i/yaw_d 或嵌套 yaw_pid；缺省保持当前值。"""
+    source: Dict[str, Any] = {}
+    nested = payload.get("yaw_pid")
+    if isinstance(nested, dict):
+        source.update(nested)
+    for key, name in (("p", "yaw_p"), ("i", "yaw_i"), ("d", "yaw_d")):
+        if name in payload:
+            source[key] = payload[name]
+    if not source:
+        return {
+            "p": float(current_yaw_pid.get("p", 0.0)),
+            "i": float(current_yaw_pid.get("i", 0.0)),
+            "d": float(current_yaw_pid.get("d", 0.0)),
+        }
+    return {
+        "p": _to_float(source.get("p", current_yaw_pid.get("p", 0.0)), float(current_yaw_pid.get("p", 0.0))),
+        "i": _to_float(source.get("i", current_yaw_pid.get("i", 0.0)), float(current_yaw_pid.get("i", 0.0))),
+        "d": _to_float(source.get("d", current_yaw_pid.get("d", 0.0)), float(current_yaw_pid.get("d", 0.0))),
+    }
+
+
 def build_fallback_suggestion(
     current_pid: Dict[str, float],
     metrics: Dict[str, float],
@@ -193,7 +230,21 @@ def pid_equals(left: Dict[str, float], right: Dict[str, float], tolerance: float
     return all(abs(float(left.get(key, 0.0)) - float(right.get(key, 0.0))) <= tolerance for key in PID_KEYS)
 
 
-def score_metrics(metrics: Dict[str, float]) -> float:
+def yaw_coupling_penalty(metrics: Dict[str, float], tune_axis: str | None = None) -> float:
+    """X/Y 调参时的航向代价；YAW 自调参或无 yaw 数据时为 0。"""
+    axis = str(tune_axis or metrics.get("tune_axis") or "").strip().upper()
+    if axis not in {"X", "Y"}:
+        return 0.0
+
+    yaw_peak = abs(float(metrics.get("yaw_delta_peak_deg", 0.0) or 0.0))
+    sat_ratio = float(metrics.get("hold_yaw_saturated_ratio", 0.0) or 0.0)
+    budget = float(CONFIG.get("HARDWARE_YAW_SOFT_BUDGET_DEG", 5.0) or 5.0)
+    peak_excess = max(0.0, yaw_peak - budget)
+    # 3° 超预算约等价于 9mm 误差；hold 饱和比满量程约等价于 10 分。
+    return 3.0 * peak_excess + 10.0 * max(0.0, min(1.0, sat_ratio))
+
+
+def score_metrics(metrics: Dict[str, float], tune_axis: str | None = None) -> float:
     """将控制表现压缩成一个可比较的分数，越低越好。"""
     avg_error          = float(metrics.get("avg_error", 1e9) or 1e9)
     steady_state_error = float(metrics.get("steady_state_error", 1e9) or 1e9)
@@ -208,11 +259,18 @@ def score_metrics(metrics: Dict[str, float]) -> float:
     elif status != "STABLE":
         status_penalty = 20.0
 
-    return avg_error + steady_state_error * 1.2 + overshoot * 0.6 + status_penalty
+    return (
+        avg_error
+        + steady_state_error * 1.2
+        + overshoot * 0.6
+        + status_penalty
+        + yaw_coupling_penalty(metrics, tune_axis=tune_axis)
+    )
 
 
 def is_better_metrics(candidate: Dict[str, float], baseline: Dict[str, float], epsilon: float = 1e-6) -> bool:
-    return score_metrics(candidate) + epsilon < score_metrics(baseline)
+    axis = candidate.get("tune_axis") or baseline.get("tune_axis")
+    return score_metrics(candidate, tune_axis=axis) + epsilon < score_metrics(baseline, tune_axis=axis)
 
 
 def maybe_update_best_result(
@@ -220,6 +278,7 @@ def maybe_update_best_result(
     pid        : Dict[str, float],
     metrics    : Dict[str, float],
     round_num  : int,
+    yaw_pid    : Dict[str, float] | None = None,
 ) -> Dict[str, Any] | None:
     """只记录稳定状态下的最佳 PID，避免回滚到坏参数。"""
     if str(metrics.get("status", "UNKNOWN")).upper() != "STABLE":
@@ -230,6 +289,8 @@ def maybe_update_best_result(
         "pid"    : {key: float(pid.get(key, 0.0)) for key in PID_KEYS},
         "metrics": dict(metrics),
     }
+    if yaw_pid is not None:
+        candidate["yaw_pid"] = {key: float(yaw_pid.get(key, 0.0)) for key in PID_KEYS}
 
     if best_result is None or is_better_metrics(candidate["metrics"], best_result["metrics"]):
         return candidate

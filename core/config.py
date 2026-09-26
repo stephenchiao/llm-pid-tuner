@@ -6,6 +6,7 @@ import io
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 
@@ -68,7 +69,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "BAUD_RATE"                     : 115200,
     "LLM_API_KEY"                   : "your-deepseek-api-key-here",
     "LLM_API_BASE_URL"              : "https://api.deepseek.com",
-    "LLM_MODEL_NAME"                : "deepseek-v4-flash",
+    "LLM_MODEL_NAME"                : "deepseek-flash",
     "LLM_PROVIDER"                  : "openai",
     "HTTP_PROXY"                    : "",
     "HTTPS_PROXY"                   : "",
@@ -85,10 +86,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "REQUIRED_STABLE_ROUNDS"        : 3,
     "HARDWARE_STAGE_MAX_ROUNDS"     : 5,
     "HARDWARE_VERIFY_ROUNDS"        : 3,
-    "HARDWARE_RESUME_LAST_PID"      : True,
-    "HARDWARE_TUNE_AXIS"            : "Y",
-    "HARDWARE_OUTPUT_LIMIT_MPS"     : 0.15,
+    "HARDWARE_RESUME_LAST_PID"      : False,
+    "HARDWARE_TUNE_AXIS"            : "X",
+    "HARDWARE_INITIAL_PID_X"        : {"p": 0.00495, "i": 0.0, "d": 0.0},
+    "HARDWARE_INITIAL_PID_Y"        : {"p": 0.0018, "i": 0.0, "d": 0.0},
+    "HARDWARE_INITIAL_PID_YAW"      : {"p": 0.02, "i": 0.000015, "d": 0.0},
+    "HARDWARE_OUTPUT_LIMIT_MPS"     : 0.20,
     "HARDWARE_YAW_OUTPUT_LIMIT_RADPS": 0.25,
+    # X/Y 调参时的航向协同（方案 A+B）。关闭后退回旧行为：只调主轴、不修正 YAW。
+    "HARDWARE_YAW_COPILOT"          : True,
+    "HARDWARE_YAW_SOFT_BUDGET_DEG"  : 5.0,
+    "HARDWARE_YAW_VERIFY_LIMIT_DEG" : 8.0,
+    "HARDWARE_YAW_HOLD_LIMIT_RADPS" : 0.15,
+    "HARDWARE_YAW_HOLD_SAT_RATIO_MAX": 0.5,
+    "HARDWARE_YAW_ADJUST_SAT_RATIO" : 0.25,
     "HARDWARE_POST_MOTION_TESTS"    : True,
     "HARDWARE_TEST_LINEAR_MPS"      : 0.03,
     "HARDWARE_TEST_TURN_RADPS"      : 0.15,
@@ -103,8 +114,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 CONFIG: dict[str, Any] = dict(DEFAULT_CONFIG)
-CONFIG_PATH = "config.json"
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+CONFIG_PATH = PROJECT_DIR / "config.json"
 PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")
+
+
+def resolve_project_path(value: str | os.PathLike[str]) -> Path:
+    """Resolve tool-owned relative paths against llm-pid-tuner-main, never cwd."""
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else PROJECT_DIR / path
 
 
 def _parse_env_value(default_value: Any, raw_value: str) -> Any:
@@ -122,9 +140,9 @@ def load_config(create_if_missing: bool = True, verbose: bool = True) -> None:
     CONFIG.clear()
     CONFIG.update(DEFAULT_CONFIG)
 
-    if os.path.exists(CONFIG_PATH):
+    if CONFIG_PATH.exists():
         try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+            with CONFIG_PATH.open("r", encoding="utf-8") as handle:
                 user_config = json.load(handle)
             CONFIG.update(user_config)
             if verbose:
@@ -134,7 +152,7 @@ def load_config(create_if_missing: bool = True, verbose: bool = True) -> None:
                 print(f"[WARN] 配置文件加载失败: {exc}，将使用默认值。")
     elif create_if_missing:
         try:
-            with open(CONFIG_PATH, "w", encoding="utf-8") as handle:
+            with CONFIG_PATH.open("w", encoding="utf-8") as handle:
                 json.dump(CONFIG, handle, indent=4, ensure_ascii=False)
             if verbose:
                 print(f"[INFO] 未找到配置文件，已生成默认配置: {CONFIG_PATH}")

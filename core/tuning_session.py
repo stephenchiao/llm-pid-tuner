@@ -9,7 +9,9 @@ from core.config import CONFIG
 from core.history import TuningHistory
 from pid_safety import (
     apply_pid_guardrails,
+    apply_yaw_guardrails,
     build_fallback_suggestion,
+    extract_yaw_pid,
     is_good_enough,
     maybe_update_best_result,
     pid_equals,
@@ -31,6 +33,7 @@ class TuningSessionState:
     fallback_count: int = 0
     guardrail_count: int = 0
     rollback_count: int = 0
+    current_yaw_pid: dict[str, float] | None = None
 
 
 @slotted_dataclass
@@ -42,6 +45,7 @@ class RoundEvaluation:
     best_result: dict[str, Any] | None = None
     best_result_updated: bool = False
     rollback_pid: dict[str, float] | None = None
+    rollback_yaw_pid: dict[str, float] | None = None
     completed_reason: str | None = None
 
 
@@ -55,6 +59,7 @@ class DecisionOutcome:
     fallback_used: bool
     status: str
     completed_reason: str | None = None
+    safe_yaw_pid: dict[str, float] | None = None
 
 
 def create_tuning_session(
@@ -63,6 +68,7 @@ def create_tuning_session(
     setpoint: float | None = None,
     max_history: int = 5,
     buffer_size: int | None = None,
+    initial_yaw_pid: dict[str, float] | None = None,
 ) -> TuningSessionState:
     buffer = AdvancedDataBuffer(
         max_size=int(buffer_size if buffer_size is not None else CONFIG["BUFFER_SIZE"])
@@ -80,13 +86,18 @@ def create_tuning_session(
             "steady_state_error_threshold": CONFIG["GOOD_ENOUGH_STEADY_STATE_ERROR"],
             "overshoot_threshold": CONFIG["GOOD_ENOUGH_OVERSHOOT"],
         },
+        current_yaw_pid=dict(initial_yaw_pid) if initial_yaw_pid is not None else None,
     )
 
 
 def evaluate_completed_round(
-    state: TuningSessionState, current_pid: dict[str, float]
+    state: TuningSessionState,
+    current_pid: dict[str, float],
+    *,
+    tune_axis: str | None = None,
+    current_yaw_pid: dict[str, float] | None = None,
 ) -> RoundEvaluation:
-    metrics = state.buffer.calculate_advanced_metrics()
+    metrics = state.buffer.calculate_advanced_metrics(tune_axis=tune_axis)
     round_index = state.round_num + 1
     # 检测重试：同一轮因 pause 被中断后重新进入，last_round 已等于 round_index
     is_retry = state.last_round == round_index
@@ -103,20 +114,34 @@ def evaluate_completed_round(
 
     previous_best = state.best_result
     state.best_result = maybe_update_best_result(
-        state.best_result, current_pid, metrics, round_index
+        state.best_result,
+        current_pid,
+        metrics,
+        round_index,
+        yaw_pid=current_yaw_pid if current_yaw_pid is not None else state.current_yaw_pid,
     )
     best_result_updated = (
         state.best_result is not None and state.best_result is not previous_best
     )
 
     rollback_pid: dict[str, float] | None = None
+    rollback_yaw_pid: dict[str, float] | None = None
     completed_reason: str | None = None
+    active_yaw = current_yaw_pid if current_yaw_pid is not None else state.current_yaw_pid
+    yaw_differs = bool(
+        state.best_result
+        and state.best_result.get("yaw_pid")
+        and active_yaw
+        and not pid_equals(active_yaw, state.best_result["yaw_pid"])
+    )
     if (
         state.best_result
-        and not pid_equals(current_pid, state.best_result["pid"])
+        and (not pid_equals(current_pid, state.best_result["pid"]) or yaw_differs)
         and should_rollback_to_best(metrics, state.best_result["metrics"])
     ):
         rollback_pid = dict(state.best_result["pid"])
+        if state.best_result.get("yaw_pid"):
+            rollback_yaw_pid = dict(state.best_result["yaw_pid"])
         if is_good_enough(state.best_result["metrics"], state.good_enough_rules):
             completed_reason = "rollback_to_best"
     elif (
@@ -135,14 +160,21 @@ def evaluate_completed_round(
         best_result=state.best_result,
         best_result_updated=best_result_updated,
         rollback_pid=rollback_pid,
+        rollback_yaw_pid=rollback_yaw_pid,
         completed_reason=completed_reason,
     )
 
 
-def apply_rollback(state: TuningSessionState, rollback_pid: dict[str, float]) -> None:
+def apply_rollback(
+    state: TuningSessionState,
+    rollback_pid: dict[str, float],
+    rollback_yaw_pid: dict[str, float] | None = None,
+) -> None:
     state.rollback_count += 1
     state.round_num += 1
     state.buffer.current_pid = dict(rollback_pid)
+    if rollback_yaw_pid is not None:
+        state.current_yaw_pid = dict(rollback_yaw_pid)
     state.buffer.reset()
 
 
@@ -152,6 +184,7 @@ def record_rollback_round(
     rollback_pid: dict[str, float],
     *,
     target_round: int | None = None,
+    rollback_yaw_pid: dict[str, float] | None = None,
 ) -> str:
     target_label = (
         f"round {target_round}" if target_round is not None else "the best stable round"
@@ -161,6 +194,11 @@ def record_rollback_round(
         f"{target_label}. Reverted to "
         f"P={rollback_pid['p']:.4f}, I={rollback_pid['i']:.4f}, D={rollback_pid['d']:.4f}."
     )
+    if rollback_yaw_pid is not None:
+        analysis += (
+            f" YAW hold restored to P={rollback_yaw_pid['p']:.4f}, "
+            f"I={rollback_yaw_pid['i']:.6f}, D={rollback_yaw_pid['d']:.4f}."
+        )
     thought = (
         "This round was evaluated with "
         f"P={evaluation.current_pid['p']:.4f}, I={evaluation.current_pid['i']:.4f}, D={evaluation.current_pid['d']:.4f}. "
@@ -183,6 +221,8 @@ def finalize_decision(
     *,
     limits: dict[str, dict[str, float]] | None = None,
     freeze_integral: bool = False,
+    current_yaw_pid: dict[str, float] | None = None,
+    allow_yaw_adjust: bool = False,
 ) -> DecisionOutcome:
     if not result:
         result = build_fallback_suggestion(
@@ -213,6 +253,20 @@ def finalize_decision(
         thought,
     )
     state.buffer.current_pid = dict(safe_pid)
+
+    yaw_baseline = dict(
+        current_yaw_pid
+        if current_yaw_pid is not None
+        else (state.current_yaw_pid or {"p": 0.0, "i": 0.0, "d": 0.0})
+    )
+    if allow_yaw_adjust:
+        proposed_yaw = extract_yaw_pid(result, yaw_baseline)
+        safe_yaw_pid, yaw_notes = apply_yaw_guardrails(yaw_baseline, proposed_yaw)
+        guardrail_notes.extend(yaw_notes)
+    else:
+        safe_yaw_pid = dict(yaw_baseline)
+    state.current_yaw_pid = dict(safe_yaw_pid)
+
     if fallback_used:
         state.fallback_count += 1
     if guardrail_notes:
@@ -230,6 +284,7 @@ def finalize_decision(
         fallback_used=fallback_used,
         status=status,
         completed_reason=completed_reason,
+        safe_yaw_pid=safe_yaw_pid,
     )
 
 
@@ -241,6 +296,7 @@ def build_tuning_result(
         "model": CONFIG["LLM_MODEL_NAME"],
         "rounds_completed": state.last_round,
         "final_pid": dict(final_pid),
+        "final_yaw_pid": dict(state.current_yaw_pid or {}),
         "final_metrics": dict(state.last_metrics),
         "stopped": stopped,
         "fallback_count": state.fallback_count,

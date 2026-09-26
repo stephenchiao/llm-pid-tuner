@@ -8,12 +8,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.pid_results import append_pid_result, load_last_usable_pid
+from core.pid_results import (
+    append_pid_result,
+    build_local_tuning_summary,
+    load_last_usable_pid,
+)
 from pid_safety import get_pid_limits
 from tuner import (
     _build_hardware_prompt_context,
     _freeze_pid_terms_for_stage,
     _hardware_validation_passed,
+    _parse_pid_snapshot,
     _run_post_tune_motion_tests,
 )
 
@@ -36,7 +41,7 @@ class HardwareStageTests(unittest.TestCase):
         self.assertEqual(context["adjustable_terms"], "I")
         self.assertEqual(context["frozen_terms"], "P,D")
         self.assertEqual(context["controller_output_limit"], 0.2)
-        self.assertEqual(context["tune_axis"], "Y")
+        self.assertEqual(context["tune_axis"], "X")
 
     def test_yaw_prompt_context_uses_angle_units(self):
         context = _build_hardware_prompt_context("COM3", "P", 0.25, "YAW")
@@ -94,6 +99,17 @@ class HardwareStageTests(unittest.TestCase):
 
 
 class PidResultStoreTests(unittest.TestCase):
+    def test_parse_pid_snapshot_keeps_all_axes(self):
+        snapshot = _parse_pid_snapshot(
+            "# PID ALL X=0.0033000,0.00000000,0.0000000 "
+            "Y=0.0033000,0.00000000,0.0000000 "
+            "YAW=0.0200000,0.00000000,0.0000000"
+        )
+
+        self.assertEqual(snapshot["X"]["p"], 0.0033)
+        self.assertEqual(snapshot["Y"]["p"], 0.0033)
+        self.assertEqual(snapshot["YAW"]["p"], 0.02)
+
     def test_append_pid_result_keeps_previous_sessions(self):
         result = {
             "provider": "openai",
@@ -101,8 +117,21 @@ class PidResultStoreTests(unittest.TestCase):
             "rounds_completed": 12,
             "completed_reason": "staged_validation_passed",
             "final_pid": {"p": 0.0045, "i": 0.0, "d": 0.0},
+            "pid_snapshot": {
+                "X": {"p": 0.0045, "i": 0.0, "d": 0.0},
+                "Y": {"p": 0.0033, "i": 0.0, "d": 0.0},
+                "YAW": {"p": 0.02, "i": 0.0, "d": 0.0},
+            },
+            "output_limit": 0.2,
+            "output_unit": "m/s",
             "final_metrics": {"overshoot": 1.7},
             "motion_tests": [{"action": "LEFT", "passed": True}],
+            "ai_summary": {
+                "process_summary": "逐步调整P并完成验证。",
+                "evaluation": "响应稳定。",
+                "recommendation": "继续负载复验。",
+                "source": "llm",
+            },
         }
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "pid_results.jsonl"
@@ -112,8 +141,25 @@ class PidResultStoreTests(unittest.TestCase):
 
         self.assertEqual(len(records), 2)
         self.assertEqual(records[-1]["final_pid"]["p"], 0.0045)
+        self.assertEqual(records[-1]["format_version"], 3)
+        self.assertEqual(records[-1]["pid_snapshot"]["YAW"]["p"], 0.02)
+        self.assertEqual(records[-1]["ai_summary"]["source"], "llm")
         self.assertEqual(records[-1]["completed_reason"], "staged_validation_passed")
         self.assertTrue(records[-1]["motion_tests"][0]["passed"])
+
+    def test_local_summary_marks_interrupted_result_unreliable(self):
+        summary = build_local_tuning_summary(
+            {
+                "tune_axis": "X",
+                "rounds_completed": 2,
+                "completed_reason": "keyboard_interrupt",
+                "final_pid": {"p": 0.0033, "i": 0.0, "d": 0.0},
+                "final_metrics": {"current_error": 12.0},
+            }
+        )
+
+        self.assertEqual(summary["source"], "local_fallback")
+        self.assertIn("未形成可自动复用", summary["evaluation"])
 
     def test_load_last_usable_pid_skips_interrupted_newer_record(self):
         records = [
@@ -139,7 +185,7 @@ class PidResultStoreTests(unittest.TestCase):
             )
             pid = load_last_usable_pid(str(path), get_pid_limits("hardware"))
 
-        self.assertEqual(pid, {"p": 0.004, "i": 0.0, "d": 0.0})
+        self.assertIsNone(pid)  # Legacy unbound metrics cannot authorize reuse.
 
     def test_pid_history_is_isolated_by_axis(self):
         records = [
@@ -154,6 +200,11 @@ class PidResultStoreTests(unittest.TestCase):
                 "final_pid": {"p": 0.02, "i": 0.0, "d": 0.0},
             },
         ]
+        for record in records:
+            record.update(format_version=3, final_metrics={}, stop_confirmation="feedback_confirmed",
+                          verified_pid=record["final_pid"],
+                          tested_result={"axis": record["tune_axis"], "verified": True,
+                                         "pid": record["final_pid"], "metrics": {}})
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "pid_results.jsonl"
             path.write_text(

@@ -121,6 +121,12 @@ _MODE_NOTES = {
 - 硬件调参器会通过 tuning stage 指明当前 P/I/D 阶段；只能修改 adjustable terms，frozen terms 必须原值返回。
 - 硬件模式下 status=DONE 表示“当前阶段已经调好”，调参器会自动进入下一阶段，并不代表整个流程立即结束。
 - I 或 D 没有改善空间时可以保持为 0，并用 DONE 结束当前阶段；禁止为了得到非零参数而强行增加 I 或 D。
+- **X/Y 调参的航向协同（重要）**：横移/纵移时存在独立 YAW hold 环，观测中的 yaw_delta_*、hold_yaw_saturated_ratio 反映航向被拧动的程度。
+- 主轴目标与航向目标同时成立才算好：主轴误差小，且 yaw_delta_peak 不超过 yaw_peak_budget_deg。
+- 偏航超标或 hold 饱和时：禁止提高主轴 P；应小幅提高 YAW 的 P（yaw_p），或保持主轴并接受更长到位时间。
+- YAW 修正字段为可选：yaw_p / yaw_i / yaw_d（或嵌套 yaw_pid）。缺省表示保持当前 YAW hold 参数。
+- YAW 单轮增幅必须很小（约 1.2 倍以内）；不要为了压偏航而大幅修改 YAW 的 I/D。
+- 当前 YAW P 已接近实用上限时，优先降低主轴攻击性，而不是继续加 yaw_p。
 """.strip(),
 }
 
@@ -128,7 +134,7 @@ _MODE_TASK_LINES = {
     "generic": "分析本轮数据，结合历史记录，在超调 <3% 的前提下尽可能缩短上升时间，同时消除稳态误差。",
     "python_sim": "高效调优 Python 热力仿真，在超调 <3% 的前提下把响应速度推到极限，同时稳态误差趋近于零。",
     "simulink": "调优 Simulink 仿真 PID，在超调 <3% 的前提下把上升时间压到最短，稳态误差趋近于零。忽略 PWM 字段。",
-    "hardware": "保守调优真实硬件控制回路，优先保障系统稳定性，严防振荡和危险超调，在安全前提下逐步提升响应速度。",
+    "hardware": "保守调优真实硬件控制回路，优先保障系统稳定性，严防振荡和危险超调，在安全前提下逐步提升响应速度。X/Y 调参时同时满足航向预算，必要时用小幅 yaw_p 修正 hold 环。",
 }
 
 
@@ -194,6 +200,7 @@ def build_user_prompt(
                 f"- {_MODE_TASK_LINES.get(resolved_mode, _MODE_TASK_LINES['generic'])}",
                 "- 请先对比本轮数据与历史记录的差异，再决定参数调整方向。",
                 "- 仅输出 JSON，包含字段：thought_process、analysis_summary、tuning_action、p、i、d、status。",
+                "- X/Y 调参时可选字段：yaw_p、yaw_i、yaw_d（或 yaw_pid 对象），用于小幅修正航向 hold 环；不要输出其他字段。",
             ]
         )
     )

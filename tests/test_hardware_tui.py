@@ -1,5 +1,6 @@
 import math
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from queue import Queue
@@ -9,6 +10,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import tuner
+from core.round_csv import HardwareRoundCsvRecorder
 from sim.runtime import (
     EVENT_DECISION,
     EVENT_LIFECYCLE,
@@ -28,6 +30,92 @@ def _make_csv_line(timestamp: int, temp: float, pwm: float = 200.0) -> str:
 
 
 class HardwareTuiLoopTests(unittest.TestCase):
+    def setUp(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        recorder_patch = patch.object(
+            tuner,
+            "HardwareRoundCsvRecorder",
+            side_effect=lambda _root, axis: HardwareRoundCsvRecorder(
+                Path(temp_dir.name), axis
+            ),
+        )
+        recorder_patch.start()
+        self.addCleanup(recorder_patch.stop)
+
+    def test_ops_preflight_retries_until_link_is_ready(self):
+        class FakeBridge:
+            def __init__(self):
+                self.commands: list[str] = []
+                self.responses = [
+                    "# OPS LINK=NO_DATA X=0.00 Y=0.00 YAW=0.00",
+                    "# OPS LINK=OK X=1.25 Y=-2.50 YAW=3.75 "
+                    "CENTER_X=1.00 CENTER_Y=-27.50",
+                ]
+
+            def send_command(self, cmd):
+                self.commands.append(cmd)
+
+            def read_line(self):
+                return self.responses.pop(0) if self.responses else None
+
+        bridge = FakeBridge()
+        with patch.object(tuner.time, "sleep", return_value=None):
+            pose = tuner._wait_for_ops_ready(bridge, timeout_sec=0.2)
+
+        self.assertIsNotNone(pose)
+        self.assertEqual(pose["x"], 1.25)
+        self.assertGreaterEqual(bridge.commands.count("OPS STATUS"), 1)
+
+    def test_stop_before_start_is_reported_as_hardware_fault(self):
+        sent_commands: list[str] = []
+
+        class FakeBridge:
+            def __init__(self, _port, _baudrate, emit_console=True):
+                self.emit_console = emit_console
+                self.last_error = ""
+                self._lines: list[str] = []
+
+            def connect(self):
+                return True
+
+            def disconnect(self):
+                return None
+
+            def clear_input_buffer(self):
+                return None
+
+            def read_line(self):
+                return self._lines.pop(0) if self._lines else None
+
+            def parse_data(self, _line):
+                return None
+
+            def send_command(self, cmd):
+                sent_commands.append(cmd)
+                if cmd.startswith("SET P:"):
+                    # Reproduce the old firmware/priority ordering from the
+                    # field log: the fault stop arrives before its start line.
+                    self._lines.extend(
+                        ["# ROUND STOP CAN FAULT AXIS=X", "# ROUND START 1 AXIS=X"]
+                    )
+
+        with patch.object(tuner, "SerialBridge", FakeBridge):
+            with patch.dict(
+                tuner.CONFIG,
+                {"BUFFER_SIZE": 3, "MAX_TUNING_ROUNDS": 2},
+                clear=False,
+            ):
+                with patch.object(tuner.time, "sleep", return_value=None):
+                    result = tuner._run_hardware_tuning_loop(
+                        "COM9",
+                        emit_console=False,
+                        initial_pid={"p": 0.0033, "i": 0.0, "d": 0.0},
+                    )
+
+        self.assertEqual(result["completed_reason"], "hardware_stopped")
+        self.assertTrue(any(cmd.startswith("SET P:") for cmd in sent_commands))
+
     def test_ops_offset_compensation_removes_pure_rotation_arc(self):
         start_center = tuner._ops_to_chassis_center(0.0, 25.0, 0.0)
         yaw_deg = 29.05
@@ -81,7 +169,7 @@ class HardwareTuiLoopTests(unittest.TestCase):
             ),
         )
 
-    def test_hardware_loop_applies_initial_pid_before_tuning(self):
+    def test_zero_round_limit_does_not_start_motion(self):
         sent_commands: list[str] = []
 
         class FakeBridge:
@@ -122,17 +210,22 @@ class HardwareTuiLoopTests(unittest.TestCase):
                 )
 
         self.assertEqual(
-            sent_commands[:7],
+            sent_commands[:11],
             [
+                "PROTO VERSION",
+                "MODE TUNE",
                 "PID LIMIT X 0.150",
                 "PID LIMIT Y 0.150",
                 "PID LIMIT YAW 0.250",
+                "PID SET X 0.00495 0.0 0.0",
+                "PID SET YAW 0.02 1.5e-05 0.0",
                 "TUNE AXIS Y",
                 "STATUS",
                 "TUNE LIMIT 0.150",
-                "SET P:2.5 I:0.4 D:0.1",
+                "STOP",
             ],
         )
+        self.assertEqual(sent_commands[-1], "MODE WORK")
 
     def test_hardware_loop_emits_stream_and_decision_events(self):
         event_queue = Queue()
@@ -337,7 +430,11 @@ class HardwareTuiLoopTests(unittest.TestCase):
                     clear=False,
                 ):
                     with patch.object(tuner.time, "sleep", return_value=None):
-                        result = tuner._run_hardware_tuning_loop("COM9", emit_console=False)
+                        result = tuner._run_hardware_tuning_loop(
+                            "COM9",
+                            emit_console=False,
+                            initial_pid={"p": 0.001, "i": 0.0, "d": 0.0},
+                        )
 
         self.assertEqual(stages, ["P", "I", "D"])
         self.assertEqual(result["completed_reason"], "staged_validation_passed")

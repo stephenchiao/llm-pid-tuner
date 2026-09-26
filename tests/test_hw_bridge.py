@@ -10,7 +10,64 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hw.bridge import DEMO_SERIAL_PORT, SerialBridge, select_serial_port
 
 
+class FakeSerial:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.writes = []
+        self.is_open = True
+
+    def write(self, payload):
+        self.writes.append(bytes(payload))
+        return len(payload)
+
+    def readline(self):
+        if self.responses:
+            return (self.responses.pop(0) + "\n").encode("utf-8")
+        return b""
+
+    def close(self):
+        self.is_open = False
+
+
 class DemoSerialBridgeTests(unittest.TestCase):
+    def test_claim_accepts_current_firmware_extended_reply(self):
+        device = FakeSerial(["# STOP MODE=WORK", "# HOST LINK COM OK HEARTBEAT=OFF"])
+        with patch("hw.bridge.serial.Serial", return_value=device):
+            bridge = SerialBridge("COM9", 115200, emit_console=False)
+            self.assertTrue(bridge.connect())
+
+    def test_claim_rejects_wrong_host_and_non_ok_token(self):
+        for response in ("# HOST LINK RPI OK", "# HOST LINK COM OKAY", "# HOST LINK COM BUSY"):
+            with self.subTest(response=response):
+                device = FakeSerial(["# STOP MODE=WORK", response])
+                with patch("hw.bridge.serial.Serial", return_value=device), patch(
+                    "hw.bridge.HOST_LINK_TIMEOUT_SEC", 0.01
+                ):
+                    bridge = SerialBridge("COM9", 115200, emit_console=False)
+                    self.assertFalse(bridge.connect())
+
+    def test_claim_waits_for_stop_before_sending_link(self):
+        class OrderedDevice(FakeSerial):
+            def readline(self):
+                if self.responses and self.responses[0].startswith("# STOP"):
+                    self.assert_stop_only()
+                return super().readline()
+
+            def assert_stop_only(self):
+                assert self.writes == [b"STOP\n"]
+
+        device = OrderedDevice(["# STOP MODE=WORK", "# HOST LINK COM OK HEARTBEAT=OFF"])
+        with patch("hw.bridge.serial.Serial", return_value=device):
+            self.assertTrue(SerialBridge("COM9", 115200, emit_console=False).connect())
+
+    def test_missing_stop_ack_does_not_send_host_link(self):
+        device = FakeSerial([])
+        with patch("hw.bridge.serial.Serial", return_value=device), patch(
+            "hw.bridge.HOST_LINK_TIMEOUT_SEC", 0.01
+        ):
+            self.assertFalse(SerialBridge("COM9", 115200, emit_console=False).connect())
+        self.assertEqual(device.writes, [b"STOP\n"])
+
     def test_parse_extended_hardware_csv_pose_fields(self):
         bridge = SerialBridge("COM9", 115200, emit_console=False)
         data = bridge.parse_data(
@@ -46,6 +103,13 @@ class DemoSerialBridgeTests(unittest.TestCase):
         self.assertAlmostEqual(second_data["i"], 0.4, places=3)
         self.assertAlmostEqual(second_data["d"], 0.1, places=3)
         self.assertGreaterEqual(second_data["timestamp"], first_data["timestamp"])
+
+    def test_real_port_claims_com_before_connect_succeeds(self):
+        device = FakeSerial(["# STOP MODE=WORK", "# HOST LINK COM OK"])
+        with patch("hw.bridge.serial.Serial", return_value=device):
+            bridge = SerialBridge("COM9", 115200, emit_console=False)
+            self.assertTrue(bridge.connect())
+        self.assertEqual(device.writes[:2], [b"STOP\n", b"HOST LINK COM\n"])
 
 
 class SelectSerialPortTests(unittest.TestCase):

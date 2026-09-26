@@ -7,6 +7,8 @@ core/buffer.py - 增强版数据缓冲器与高级指标计算
 from collections import deque
 from typing import Any, Dict
 
+from core.config import CONFIG
+
 
 class AdvancedDataBuffer:
     """增强版数据缓冲器"""
@@ -34,7 +36,7 @@ class AdvancedDataBuffer:
     def reset(self) -> None:
         self.buffer.clear()
 
-    def calculate_advanced_metrics(self) -> Dict[str, Any]:
+    def calculate_advanced_metrics(self, tune_axis: str | None = None) -> Dict[str, Any]:
         """计算高级控制指标"""
         if not self.buffer:
             return {}
@@ -76,7 +78,7 @@ class AdvancedDataBuffer:
         elif avg_error > 10.0 and steady_state_error > 5.0:
             status = "SLOW_RESPONSE"
 
-        return {
+        metrics: Dict[str, Any] = {
             "avg_error"         : avg_error,
             "max_error"         : max_error,
             "current_error"     : current_error,
@@ -86,9 +88,44 @@ class AdvancedDataBuffer:
             "status"            : status,
             "setpoint"          : self.setpoint,
         }
+        if tune_axis:
+            metrics["tune_axis"] = str(tune_axis).upper()
+        metrics.update(self._yaw_coupling_metrics(data))
+        return metrics
 
-    def to_prompt_data(self) -> str:
-        metrics = self.calculate_advanced_metrics()
+    def _yaw_coupling_metrics(self, data: list[Dict[str, float]]) -> Dict[str, float]:
+        """X/Y 调参时用于评分与提示词的航向耦合指标。"""
+        yaw_values = [
+            float(sample["yaw_delta"])
+            for sample in data
+            if sample.get("yaw_delta") is not None
+        ]
+        cross_values = [
+            float(sample["cross_track"])
+            for sample in data
+            if sample.get("cross_track") is not None
+        ]
+        hold_limit = float(CONFIG.get("HARDWARE_YAW_HOLD_LIMIT_RADPS", 0.15) or 0.15)
+        hold_values = [
+            abs(float(sample["hold_yaw_output"]))
+            for sample in data
+            if sample.get("hold_yaw_output") is not None
+        ]
+        out: Dict[str, float] = {}
+        if yaw_values:
+            out["yaw_delta_final_deg"] = yaw_values[-1]
+            out["yaw_delta_peak_deg"] = max(abs(value) for value in yaw_values)
+        if cross_values:
+            out["cross_track_final_mm"] = cross_values[-1]
+            out["cross_track_peak_mm"] = max(abs(value) for value in cross_values)
+        if hold_values and hold_limit > 0.0:
+            out["hold_yaw_saturated_ratio"] = sum(
+                value >= hold_limit * 0.99 for value in hold_values
+            ) / len(hold_values)
+        return out
+
+    def to_prompt_data(self, tune_axis: str | None = None, current_yaw_pid: Dict[str, float] | None = None) -> str:
+        metrics = self.calculate_advanced_metrics(tune_axis=tune_axis)
 
         # 下采样：如果数据太多，每隔几个点取一个
         all_data     = list(self.buffer)
@@ -108,6 +145,42 @@ class AdvancedDataBuffer:
         lines.append(
             f"- 震荡检测: 过零点 {metrics.get('zero_crossings', 0)} 次 (状态: {metrics.get('status', 'UNKNOWN')})"
         )
+        axis_label = str(tune_axis or metrics.get("tune_axis") or "").upper()
+        if axis_label in {"X", "Y"}:
+            hold_limit = float(CONFIG.get("HARDWARE_YAW_HOLD_LIMIT_RADPS", 0.15) or 0.15)
+            soft_budget = float(CONFIG.get("HARDWARE_YAW_SOFT_BUDGET_DEG", 5.0) or 5.0)
+            verify_limit = float(CONFIG.get("HARDWARE_YAW_VERIFY_LIMIT_DEG", 8.0) or 8.0)
+            yaw_pid = current_yaw_pid or {}
+            lines.append("")
+            lines.append("## 航向与耦合（X/Y 调参时必读）")
+            lines.append(
+                f"- yaw_delta_peak_deg: {float(metrics.get('yaw_delta_peak_deg', 0.0) or 0.0):.2f}"
+            )
+            lines.append(
+                f"- yaw_delta_final_deg: {float(metrics.get('yaw_delta_final_deg', 0.0) or 0.0):.2f}"
+            )
+            lines.append(
+                f"- hold_yaw_saturated_ratio: "
+                f"{float(metrics.get('hold_yaw_saturated_ratio', 0.0) or 0.0):.3f}"
+            )
+            lines.append(f"- hold_yaw_limit_radps: {hold_limit:.3f}")
+            lines.append(
+                f"- cross_track_peak_mm: {float(metrics.get('cross_track_peak_mm', 0.0) or 0.0):.2f}"
+            )
+            lines.append(
+                f"- cross_track_final_mm: {float(metrics.get('cross_track_final_mm', 0.0) or 0.0):.2f}"
+            )
+            lines.append(f"- yaw_peak_budget_deg: {soft_budget:.1f}")
+            lines.append(f"- yaw_verify_limit_deg: {verify_limit:.1f}")
+            lines.append(
+                "- current_yaw_pid: "
+                f"P={float(yaw_pid.get('p', 0.0)):.7g}, "
+                f"I={float(yaw_pid.get('i', 0.0)):.7g}, "
+                f"D={float(yaw_pid.get('d', 0.0)):.7g}"
+            )
+            lines.append(
+                "- 约束: 偏航超标时禁止提高主轴 P；优先微调 YAW hold 或接受更长到位时间。"
+            )
         lines.append("")
         lines.append(f"## 时间序列数据摘要 (采样 {len(sampled_data)} 点):")
         lines.append("SimTime(ms), Input, PWM, Error")

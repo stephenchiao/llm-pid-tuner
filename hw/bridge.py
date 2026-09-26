@@ -7,6 +7,8 @@ hw/bridge.py - serial bridge helpers for real hardware and demo mode.
 from __future__ import annotations
 
 import re
+import math
+from collections import deque
 import time
 
 import serial
@@ -21,6 +23,7 @@ DEMO_SERIAL_PORT_ALIASES = {
     "DEMO_HW",
     "VIRTUAL",
 }
+HOST_LINK_TIMEOUT_SEC = 1.5
 
 
 def _is_demo_port(port: str | None) -> bool:
@@ -69,26 +72,32 @@ class _DemoSerialDevice:
         if not command:
             return
         if command.upper() == "STATUS":
-            return
+            return len(payload)
 
         match = self._set_pid_re.fullmatch(command)
         if not match:
-            return
+            return len(payload)
 
         self._sim.set_pid(
             float(match.group("p")),
             float(match.group("i")),
             float(match.group("d")),
         )
+        return len(payload)
 
 
 class SerialBridge:
+    requires_hardware_preflight = True
+
     def __init__(self, port: str, baudrate: int, emit_console: bool = True):
         self.port = port
         self.baudrate = baudrate
         self.serial = None
         self.emit_console = emit_console
         self.last_error = ""
+        self.pending_lines = deque()
+        self.is_demo = _is_demo_port(port)
+        self.on_line = None
 
     def connect(self) -> bool:
         try:
@@ -100,50 +109,112 @@ class SerialBridge:
                 return True
 
             # Short reads keep the 0.5 s host heartbeat and safety timeout responsive.
-            self.serial = serial.Serial(self.port, self.baudrate, timeout=0.2)
+            self.serial = serial.Serial(self.port, self.baudrate, timeout=0.2, write_timeout=1.0)
+            if not self._claim_com_host():
+                self.serial.close()
+                self.serial = None
+                if self.emit_console:
+                    print(f"[ERROR] Connection failed: {self.last_error}")
+                return False
             self.last_error = ""
             if self.emit_console:
                 print(f"[INFO] Connected to {self.port}")
             return True
         except Exception as e:
             self.last_error = str(e)
+            self.disconnect()
             if self.emit_console:
                 print(f"[ERROR] Connection failed: {e}")
             return False
+
+    def _claim_com_host(self) -> bool:
+        """真机连接后先取得 COM 所有权；BUSY/超时都禁止继续调参。"""
+        self.send_silent_command("STOP")
+        # STOP 会清除固件待执行队列，确认后才能提交新的握手命令。
+        deadline = time.monotonic() + HOST_LINK_TIMEOUT_SEC
+        while time.monotonic() < deadline:
+            line = self.read_line()
+            if line and (line.startswith("# STOP MODE=") or
+                         line.startswith("# ROUND STOP HOST")):
+                break
+        else:
+            self.last_error = "timeout waiting for STOP acknowledgement"
+            return False
+        self.send_silent_command("HOST LINK COM")
+        deadline = time.monotonic() + HOST_LINK_TIMEOUT_SEC
+        while time.monotonic() < deadline:
+            line = self.read_line()
+            # 按完整 token 判断，兼容旧版及 HEARTBEAT 等扩展字段。
+            if line and line.split()[:5] == ["#", "HOST", "LINK", "COM", "OK"]:
+                return True
+        self.last_error = "timeout waiting for # HOST LINK COM OK"
+        return False
 
     def disconnect(self) -> None:
         if self.serial:
             self.serial.close()
             self.serial = None
 
+    def _read_device_line(self):
+        if not self.serial or not self.serial.is_open:
+            raise ConnectionError("serial port is closed")
+        try:
+            payload = self.serial.readline()
+            if not payload:
+                return None
+            line = payload.decode("utf-8", errors="strict").strip()
+            if self.on_line is not None:
+                self.on_line(line)
+            return line
+        except Exception as exc:
+            self.last_error = str(exc)
+            raise ConnectionError(self.last_error) from exc
+
     def read_line(self):
-        if self.serial and self.serial.is_open:
-            try:
-                return self.serial.readline().decode("utf-8", errors="ignore").strip()
-            except Exception:
-                pass
-        return None
+        if self.pending_lines:
+            return self.pending_lines.popleft()
+        return self._read_device_line()
 
-    def send_command(self, cmd: str) -> None:
-        if self.serial and self.serial.is_open:
-            try:
-                self.serial.write(f"{cmd}\n".encode("utf-8"))
-                self.last_error = ""
-                if self.emit_console:
-                    print(f"[CMD] Sent: {cmd}")
-            except Exception as e:
-                self.last_error = str(e)
-                if self.emit_console:
-                    print(f"[ERROR] Failed to send command '{cmd}': {e}")
+    def _write(self, cmd: str, *, quiet: bool = False) -> bool:
+        if not self.serial or not self.serial.is_open:
+            raise ConnectionError("serial port is closed")
+        payload = f"{cmd}\n".encode("utf-8")
+        try:
+            count = self.serial.write(payload)
+            if count != len(payload):
+                raise OSError(f"short serial write: {count}/{len(payload)}")
+        except Exception as exc:
+            self.last_error = str(exc)
+            raise ConnectionError(self.last_error) from exc
+        if self.emit_console and not quiet:
+            print(f"[CMD] Sent: {cmd}")
+        return True
 
-    def send_silent_command(self, cmd: str) -> None:
-        """Send watchdog traffic without flooding the console/TUI."""
-        if self.serial and self.serial.is_open:
-            try:
-                self.serial.write(f"{cmd}\n".encode("utf-8"))
-                self.last_error = ""
-            except Exception as e:
-                self.last_error = str(e)
+    def request(self, command, predicate, timeout=1.5):
+        """One serial reader; unrelated replies remain available to the loop."""
+        self._write(command)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            line = self._read_device_line()
+            if not line:
+                continue
+            if line.startswith(("# ERROR", "# MOTION STOP SAFETY", "# CAN SAFETY", "# CAN FEEDBACK LOST")):
+                raise RuntimeError(line)
+            if predicate(line):
+                return line
+            self.pending_lines.append(line)
+        raise TimeoutError(f"timeout waiting for {command}")
+
+    def send_command(self, cmd: str) -> bool:
+        from hw.session import configuration_reply
+        predicate = configuration_reply(cmd)
+        if predicate is not None and not self.is_demo:
+            self.request(cmd, predicate)
+            return True
+        return self._write(cmd)
+
+    def send_silent_command(self, cmd: str) -> bool:
+        return self._write(cmd, quiet=True)
 
     def clear_input_buffer(self) -> None:
         """Discard replies left from the completed hardware round."""
@@ -159,8 +230,10 @@ class SerialBridge:
         if not line or line.startswith("#"):
             return None
         parts = line.split(",")
-        if len(parts) >= 5:
+        if len(parts) >= 8:
             try:
+                if not all(math.isfinite(float(value)) for value in parts):
+                    return None
                 return {
                     "timestamp": float(parts[0]),
                     "setpoint": float(parts[1]),

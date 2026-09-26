@@ -9,13 +9,77 @@ from pathlib import Path
 from typing import Any
 
 
-_SUCCESS_REASONS = {
-    "staged_validation_passed",
-    "stable_rounds_reached",
-    "low_error_converged",
-    "rollback_to_best",
-    "llm_marked_done",
-}
+def has_verified_result(result: dict[str, Any]) -> bool:
+    evidence = result.get("tested_result")
+    pid = result.get("final_pid")
+    motion_tests = result.get("motion_tests", [])
+    return (
+        result.get("completed_reason") == "staged_validation_passed"
+        and isinstance(evidence, dict)
+        and evidence.get("verified") is True
+        and evidence.get("axis") == str(result.get("tune_axis", "Y")).upper()
+        and evidence.get("pid") == pid
+        and evidence.get("metrics") == result.get("final_metrics")
+        and result.get("verified_pid") == pid
+        and result.get("stop_confirmation") == "feedback_confirmed"
+        and isinstance(motion_tests, list)
+        and all(isinstance(item, dict) and item.get("passed") is True for item in motion_tests)
+    )
+
+
+def build_local_tuning_summary(
+    result: dict[str, Any],
+    round_history: list[dict[str, Any]] | None = None,
+) -> dict[str, str]:
+    """LLM不可用时生成可审计的简要总结，保证每次会话日志字段完整。"""
+    axis = str(result.get("tune_axis", "Y")).upper()
+    rounds = int(result.get("rounds_completed") or 0)
+    reason = str(result.get("completed_reason") or "unknown")
+    final_pid = result.get("final_pid") or {}
+    metrics = result.get("final_metrics") or {}
+    history = round_history or []
+    analyses = [
+        str(item.get("analysis", "")).strip()
+        for item in history
+        if str(item.get("analysis", "")).strip()
+    ]
+
+    process = (
+        f"{axis}轴共完成{rounds}轮，结束原因={reason}；"
+        f"最终P={float(final_pid.get('p', 0.0)):.7g}，"
+        f"I={float(final_pid.get('i', 0.0)):.7g}，"
+        f"D={float(final_pid.get('d', 0.0)):.7g}。"
+    )
+    if analyses:
+        process += "最近一轮分析：" + analyses[-1][:240]
+
+    metric_parts: list[str] = []
+    for key, label in (
+        ("current_error", "最终误差"),
+        ("overshoot", "超调"),
+        ("steady_state_error", "稳态误差"),
+        ("cross_track_peak_mm", "最大横向漂移"),
+        ("yaw_delta_peak_deg", "最大航向变化"),
+    ):
+        value = metrics.get(key)
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            metric_parts.append(f"{label}={float(value):.3g}")
+
+    passed = has_verified_result(result)
+    evaluation = "调参和验证已完成" if passed else "本次会话未形成可自动复用的可靠结果"
+    if metric_parts:
+        evaluation += "；" + "，".join(metric_parts)
+    recommendation = (
+        "保存该组参数，并在正反方向、不同载荷和连续运行条件下复验。"
+        if passed
+        else "检查结束原因和安全日志，排除硬件或数据问题后重新调试；不要自动装载本次结果。"
+    )
+    return {
+        "process_summary": process,
+        "evaluation": evaluation + "。",
+        "recommendation": recommendation,
+        "source": "local_fallback",
+    }
 
 
 def load_last_usable_pid(
@@ -54,20 +118,7 @@ def load_last_usable_pid(
         ):
             continue
 
-        reason = str(record.get("completed_reason", ""))
-        usable = reason in _SUCCESS_REASONS
-        if reason == "max_rounds_reached":
-            # 兼容验证误判修复前留下的旧记录：必须确实到位且没有明显超调。
-            metrics = record.get("final_metrics", {})
-            try:
-                tolerance = 1.0 if record_axis == "YAW" else 5.0
-                usable = (
-                    abs(float(metrics["current_error"])) <= tolerance
-                    and float(metrics["overshoot"]) <= 3.0
-                    and int(metrics.get("zero_crossings", 0)) <= 6
-                )
-            except (KeyError, TypeError, ValueError):
-                usable = False
+        usable = record.get("format_version") == 3 and has_verified_result(record)
 
         if usable:
             return values
@@ -82,7 +133,17 @@ def append_pid_result(result: dict[str, Any], path: str) -> Path | None:
 
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    ai_summary = result.get("ai_summary")
+    if not isinstance(ai_summary, dict):
+        ai_summary = build_local_tuning_summary(result)
+
     record = {
+        "format_version": 3,
+        "tested_result": result.get("tested_result"),
+        "verified_pid": result.get("verified_pid"),
+        "suggested_pid": result.get("suggested_pid"),
+        "loaded_pid": result.get("loaded_pid"),
+        "stop_confirmation": result.get("stop_confirmation", "unknown"),
         "saved_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "provider": result.get("provider"),
         "model": result.get("model"),
@@ -94,8 +155,20 @@ def append_pid_result(result: dict[str, Any], path: str) -> Path | None:
             "i": float(final_pid.get("i", 0.0)),
             "d": float(final_pid.get("d", 0.0)),
         },
+        "final_yaw_pid": result.get("final_yaw_pid", {}),
+        "pid_snapshot": result.get("pid_snapshot", {}),
+        "output_limit": result.get("output_limit"),
+        "output_unit": result.get("output_unit"),
         "final_metrics": result.get("final_metrics", {}),
+        "ai_summary": {
+            "process_summary": str(ai_summary.get("process_summary", "")),
+            "evaluation": str(ai_summary.get("evaluation", "")),
+            "recommendation": str(ai_summary.get("recommendation", "")),
+            "source": str(ai_summary.get("source", "local_fallback")),
+        },
         "motion_tests": result.get("motion_tests", []),
+        "elapsed_sec": result.get("elapsed_sec"),
+        "stopped": bool(result.get("stopped", False)),
         "fallback_count": result.get("fallback_count", 0),
         "guardrail_count": result.get("guardrail_count", 0),
         "rollback_count": result.get("rollback_count", 0),

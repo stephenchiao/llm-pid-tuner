@@ -21,8 +21,13 @@ import time
 import traceback
 from typing import Any, Callable
 
-from core.config import CONFIG, initialize_runtime_config
-from core.pid_results import append_pid_result, load_last_usable_pid
+from core.config import CONFIG, initialize_runtime_config, resolve_project_path
+from core.pid_results import (
+    append_pid_result,
+    build_local_tuning_summary,
+    load_last_usable_pid,
+)
+from core.round_csv import HardwareRoundCsvRecorder
 from core.tuning_session import (
     apply_rollback,
     build_tuning_result,
@@ -31,7 +36,8 @@ from core.tuning_session import (
     finalize_decision,
     record_rollback_round,
 )
-from hw.bridge import SerialBridge, safe_pause, select_serial_port
+from hw.bridge import SerialBridge, safe_pause, select_serial_port, _is_demo_port
+from hw.session import can_start_round
 from llm.client import LLMTuner
 from pid_safety import build_fallback_suggestion, get_pid_limits
 from sim.runtime import (
@@ -45,7 +51,6 @@ from sim.runtime import (
     SimulationController,
     now_elapsed,
     publish_event,
-    wait_while_paused,
 )
 
 HARDWARE_WRONG_DIRECTION_MM = 20.0
@@ -53,11 +58,69 @@ HARDWARE_MAX_YAW_ERROR_DEG = 15.0
 HARDWARE_TUNING_STAGES = ("P", "I", "D", "VERIFY")
 OPS_CENTER_OFFSET_X_MM = 0.0
 OPS_CENTER_OFFSET_Y_MM = 25.0
+_PID_NUMBER_PATTERN = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+_PID_ALL_PATTERN = re.compile(
+    rf"^# PID ALL X=(?P<xp>{_PID_NUMBER_PATTERN}),(?P<xi>{_PID_NUMBER_PATTERN}),(?P<xd>{_PID_NUMBER_PATTERN}) "
+    rf"Y=(?P<yp>{_PID_NUMBER_PATTERN}),(?P<yi>{_PID_NUMBER_PATTERN}),(?P<yd>{_PID_NUMBER_PATTERN}) "
+    rf"YAW=(?P<yawp>{_PID_NUMBER_PATTERN}),(?P<yawi>{_PID_NUMBER_PATTERN}),(?P<yawd>{_PID_NUMBER_PATTERN})$"
+)
 
 
 def _normalize_hardware_axis(value: Any) -> str:
     axis = str(value or "Y").strip().upper()
     return axis if axis in {"X", "Y", "YAW"} else "Y"
+
+
+def _configured_initial_pid(tune_axis: str) -> dict[str, float]:
+    defaults = {
+        "X": {"p": 0.00495, "i": 0.0, "d": 0.0},
+        "Y": {"p": 0.0018, "i": 0.0, "d": 0.0},
+        "YAW": {"p": 0.02, "i": 0.000015, "d": 0.0},
+    }
+    configured = CONFIG.get(f"HARDWARE_INITIAL_PID_{tune_axis}", defaults[tune_axis])
+    if not isinstance(configured, dict):
+        configured = defaults[tune_axis]
+    return {
+        key: float(configured.get(key, defaults[tune_axis][key]))
+        for key in ("p", "i", "d")
+    }
+
+
+def _parse_pid_snapshot(line: str) -> dict[str, dict[str, float]] | None:
+    match = _PID_ALL_PATTERN.match(str(line or "").strip())
+    if match is None:
+        return None
+    return {
+        "X": {
+            "p": float(match.group("xp")),
+            "i": float(match.group("xi")),
+            "d": float(match.group("xd")),
+        },
+        "Y": {
+            "p": float(match.group("yp")),
+            "i": float(match.group("yi")),
+            "d": float(match.group("yd")),
+        },
+        "YAW": {
+            "p": float(match.group("yawp")),
+            "i": float(match.group("yawi")),
+            "d": float(match.group("yawd")),
+        },
+    }
+
+
+def _read_pid_snapshot(bridge: Any, timeout_sec: float = 0.5) -> dict[str, dict[str, float]]:
+    """停车后读取STM32实际保存的三轴参数；失败时由调用方补当前调试轴。"""
+    bridge.send_command("PID STATUS ALL")
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        line = bridge.read_line()
+        snapshot = _parse_pid_snapshot(line or "")
+        if snapshot is not None:
+            return snapshot
+        if not line:
+            time.sleep(0.01)
+    return {}
 
 
 def _angle_error_deg(current_deg: float, reference_deg: float) -> float:
@@ -138,6 +201,16 @@ def _augment_hardware_round_metrics(
     if yaw_values:
         metrics["yaw_delta_final_deg"] = yaw_values[-1]
         metrics["yaw_delta_peak_deg"] = max(abs(value) for value in yaw_values)
+    hold_values = [
+        abs(float(sample["hold_yaw_output"]))
+        for sample in samples
+        if sample.get("hold_yaw_output") is not None
+    ]
+    hold_limit = float(CONFIG.get("HARDWARE_YAW_HOLD_LIMIT_RADPS", 0.15) or 0.15)
+    if hold_values and hold_limit > 0.0:
+        metrics["hold_yaw_saturated_ratio"] = sum(
+            value >= hold_limit * 0.99 for value in hold_values
+        ) / len(hold_values)
 
 
 def _build_hardware_prompt_context(
@@ -175,6 +248,16 @@ def _build_hardware_prompt_context(
         "frozen_terms": frozen,
         "done_meaning": "Current stage is complete; the host advances to the next stage.",
         "per_round_guardrail_hint": "Keep P within about 3x the current value, and keep I/D within about 4x. Prefer smaller moves near stability.",
+        "yaw_hold_limit_radps": float(CONFIG.get("HARDWARE_YAW_HOLD_LIMIT_RADPS", 0.15) or 0.15),
+        "yaw_peak_budget_deg": float(CONFIG.get("HARDWARE_YAW_SOFT_BUDGET_DEG", 5.0) or 5.0),
+        "yaw_verify_limit_deg": float(CONFIG.get("HARDWARE_YAW_VERIFY_LIMIT_DEG", 8.0) or 8.0),
+        "yaw_copilot_enabled": bool(CONFIG.get("HARDWARE_YAW_COPILOT", True)) and not is_yaw,
+        "yaw_adjustable_hint": (
+            "Optional yaw_p/yaw_i/yaw_d may refine the independent YAW hold loop; "
+            "change yaw_p by at most ~1.2x per round and never raise main-axis P to fight yaw."
+            if (bool(CONFIG.get("HARDWARE_YAW_COPILOT", True)) and not is_yaw)
+            else "YAW hold parameters are frozen for this session."
+        ),
     }
 
 
@@ -199,16 +282,106 @@ def _hardware_validation_passed(
     metrics: dict[str, Any], stop_reason: str, tune_axis: str = "Y"
 ) -> bool:
     """最终验证使用确定性门槛，不让 LLM 单独决定整个流程结束。"""
-    return (
+    axis = str(tune_axis or "Y").upper()
+    base_ok = (
         stop_reason == "TARGET"
         and float(metrics.get("overshoot", float("inf")))
         <= float(CONFIG["GOOD_ENOUGH_OVERSHOOT"])
         # TARGET 已表示固件连续10个周期进入 +/-5 mm；最后20%平均值包含减速段，
         # 不再用它否决已经到位的轮次，避免在 I/D/VERIFY 之间无限循环。
         and float(metrics.get("current_error", float("inf")))
-        <= (1.0 if tune_axis == "YAW" else 5.0)
+        <= (1.0 if axis == "YAW" else 5.0)
         and int(metrics.get("zero_crossings", 0)) <= 6
     )
+    if not base_ok or axis == "YAW" or not bool(CONFIG.get("HARDWARE_YAW_COPILOT", True)):
+        return base_ok
+
+    yaw_peak = abs(float(metrics.get("yaw_delta_peak_deg", 0.0) or 0.0))
+    yaw_limit = float(CONFIG.get("HARDWARE_YAW_VERIFY_LIMIT_DEG", 8.0) or 8.0)
+    if yaw_peak > yaw_limit:
+        return False
+    sat_ratio = float(metrics.get("hold_yaw_saturated_ratio", 0.0) or 0.0)
+    sat_max = float(CONFIG.get("HARDWARE_YAW_HOLD_SAT_RATIO_MAX", 0.5) or 0.5)
+    return sat_ratio <= sat_max
+
+
+def _yaw_adjust_allowed(metrics: dict[str, Any], tune_axis: str, tuning_stage: str) -> bool:
+    """策略 b：仅当偏航超预算或 hold 明显饱和时，才允许 LLM 微调 YAW hold。"""
+    if not bool(CONFIG.get("HARDWARE_YAW_COPILOT", True)):
+        return False
+    if str(tune_axis or "").upper() not in {"X", "Y"}:
+        return False
+    if tuning_stage == "VERIFY":
+        return False
+    yaw_peak = abs(float(metrics.get("yaw_delta_peak_deg", 0.0) or 0.0))
+    budget = float(CONFIG.get("HARDWARE_YAW_SOFT_BUDGET_DEG", 5.0) or 5.0)
+    sat_ratio = float(metrics.get("hold_yaw_saturated_ratio", 0.0) or 0.0)
+    sat_trigger = float(CONFIG.get("HARDWARE_YAW_ADJUST_SAT_RATIO", 0.25) or 0.25)
+    return yaw_peak > budget or sat_ratio >= sat_trigger
+
+
+class RoundAdmissionClosed(Exception):
+    pass
+
+
+def _confirm_hardware_stop(bridge):
+    if not getattr(bridge, "requires_hardware_preflight", False) or getattr(bridge, "is_demo", False):
+        bridge.send_command("STOP")
+        return "command_sent"
+    bridge.request("STOP", lambda line: line.startswith(("# STOP MODE=", "# ROUND STOP HOST")))
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        line = bridge.request("MOTOR STOP STATUS", lambda line: line.startswith("# MOTOR STOP STATE="))
+        if "STATE=CONFIRMED" in line:
+            return "feedback_confirmed"
+        time.sleep(0.05)
+    raise TimeoutError("STOP acknowledged but motor stop feedback is unconfirmed")
+
+
+def _pause_hardware(bridge, controller):
+    _confirm_hardware_stop(bridge)
+    # STOP confirmation closes the old round; account for buffered events before
+    # requesting a fresh round. No reset_input_buffer and no blind wire discard.
+    while getattr(bridge, "pending_lines", None):
+        line = bridge.read_line()
+        if line and line.startswith(("# ERROR", "# CAN SAFETY", "# MOTION STOP SAFETY")):
+            raise RuntimeError(line)
+    while controller.is_paused and not controller.should_stop:
+        line = bridge.read_line()
+        if line and line.startswith(("# ERROR", "# CAN SAFETY", "# MOTION STOP SAFETY")):
+            raise RuntimeError(line)
+        if not line:
+            time.sleep(0.01)
+
+
+def _send_next_round_commands(
+    bridge: Any,
+    safe_pid: dict[str, float],
+    safe_yaw_pid: dict[str, float] | None,
+    previous_yaw_pid: dict[str, float] | None,
+) -> list[str]:
+    """先装载 YAW hold（若有变化），再用 SET P 启动下一轮主轴测试。"""
+    sent: list[str] = []
+    if safe_yaw_pid is not None:
+        changed = True
+        if previous_yaw_pid is not None:
+            changed = any(
+                abs(float(safe_yaw_pid.get(key, 0.0)) - float(previous_yaw_pid.get(key, 0.0))) > 1e-12
+                for key in ("p", "i", "d")
+            )
+        if changed:
+            yaw_cmd = (
+                f"PID SET YAW {safe_yaw_pid['p']} {safe_yaw_pid['i']} {safe_yaw_pid['d']}"
+            )
+            bridge.send_command(yaw_cmd)
+            sent.append(yaw_cmd)
+    cmd = (
+        f"SET P:{safe_pid['p']} "
+        f"I:{safe_pid['i']} D:{safe_pid['d']}"
+    )
+    bridge.send_command(cmd)
+    sent.append(cmd)
+    return sent
 
 
 _OPS_STATUS_RE = re.compile(
@@ -227,6 +400,8 @@ def _read_ops_pose(bridge: Any, timeout_sec: float = 1.5) -> dict[str, float] | 
         line = bridge.read_line()
         if not line:
             continue
+        if line.startswith(("# ERROR", "# CAN SAFETY", "# MOTION STOP SAFETY")):
+            raise RuntimeError(line)
         match = _OPS_STATUS_RE.search(line)
         if match and match.group("link") == "OK":
             x = float(match.group("x"))
@@ -247,24 +422,36 @@ def _read_ops_pose(bridge: Any, timeout_sec: float = 1.5) -> dict[str, float] | 
     return None
 
 
-def _wait_for_chassis_auto_stop(bridge: Any, timeout_sec: float) -> bool:
+def _wait_for_ops_ready(bridge: Any, timeout_sec: float = 3.0) -> dict[str, float] | None:
+    """Wait through serial-open/reset transients before any tuning command."""
     deadline = time.monotonic() + timeout_sec
-    last_ping = time.monotonic()
     while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        pose = _read_ops_pose(bridge, timeout_sec=min(0.75, max(0.05, remaining)))
+        if pose is not None:
+            return pose
+        time.sleep(0.05)
+    return None
+
+
+def _wait_for_chassis_auto_stop(bridge: Any, timeout_sec: float, controller=None) -> bool:
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        if controller is not None and (controller.should_stop or controller.is_paused):
+            bridge.send_command("STOP")
+            return False
         line = bridge.read_line()
+        if line and line.startswith(("# ERROR", "# MOTION STOP SAFETY", "# CAN SAFETY")):
+            bridge.send_command("STOP")
+            return False
         if line and line.startswith("# MOVE AUTO STOP"):
             return True
-        now = time.monotonic()
-        if now - last_ping >= 0.5:
-            sender = getattr(bridge, "send_silent_command", bridge.send_command)
-            sender("PING")
-            last_ping = now
     bridge.send_command("MOVE STOP")
     return False
 
 
 def _run_post_tune_motion_tests(
-    bridge: Any, *, emit_console: bool = True
+    bridge: Any, *, emit_console: bool = True, controller=None
 ) -> list[dict[str, Any]]:
     """用低速短动作验收横移和旋转；这里只检查运动学，不修改PID。"""
     linear_speed = min(0.08, max(0.005, float(CONFIG["HARDWARE_TEST_LINEAR_MPS"])))
@@ -280,22 +467,33 @@ def _run_post_tune_motion_tests(
     _console(emit_console, "[MotionTest] 开始低速验收：LEFT、RIGHT、CCW、CW")
 
     for name, command, kind, expected_sign in actions:
+        if controller is not None and (controller.should_stop or controller.is_paused):
+            _confirm_hardware_stop(bridge)
+            results.append({"action": name, "passed": False, "reason": "USER_INTERRUPTED"})
+            break
         before = _read_ops_pose(bridge)
         if before is None:
             results.append({"action": name, "passed": False, "reason": "OPS_NOT_READY"})
             _console(emit_console, f"[MotionTest] {name} FAIL: OPS_NOT_READY")
-            continue
+            break
 
+        if controller is not None and (controller.should_stop or controller.is_paused):
+            _confirm_hardware_stop(bridge)
+            results.append({"action": name, "passed": False, "reason": "USER_INTERRUPTED"})
+            break
         bridge.send_command(command)
         stopped = _wait_for_chassis_auto_stop(
-            bridge, duration_ms / 1000.0 + 1.5
+            bridge, duration_ms / 1000.0 + 1.5, controller
         )
-        time.sleep(0.05)
+        if not stopped:
+            results.append({"action": name, "passed": False, "reason": "STOP_NOT_CONFIRMED"})
+            break
+        _confirm_hardware_stop(bridge)
         after = _read_ops_pose(bridge)
         if after is None:
             results.append({"action": name, "passed": False, "reason": "OPS_NOT_READY_AFTER"})
             _console(emit_console, f"[MotionTest] {name} FAIL: OPS_NOT_READY_AFTER")
-            continue
+            break
 
         raw_dx = after["x"] - before["x"]
         raw_dy = after["y"] - before["y"]
@@ -331,6 +529,8 @@ def _run_post_tune_motion_tests(
             f"[MotionTest] {name} {'PASS' if passed else 'FAIL'} "
             f"dX={dx:.1f} dY={dy:.1f} BodyRight={body_right_mm:.1f} dYaw={dyaw:.1f}",
         )
+        if not passed:
+            break
 
     return results
 
@@ -429,7 +629,7 @@ def _run_hardware_tuning_loop(
     tune_axis = _normalize_hardware_axis(CONFIG.get("HARDWARE_TUNE_AXIS", "Y"))
     is_yaw_axis = tune_axis == "YAW"
     if initial_pid is None:
-        initial_pid = {"p": 0.01 if is_yaw_axis else 0.001, "i": 0.0, "d": 0.0}
+        initial_pid = _configured_initial_pid(tune_axis)
 
     hardware_pid_limits = get_pid_limits("hardware_yaw" if is_yaw_axis else "hardware")
     hardware_output_limit = (
@@ -441,7 +641,7 @@ def _run_hardware_tuning_loop(
         2.0 if is_yaw_axis else float(CONFIG["GOOD_ENOUGH_STEADY_STATE_ERROR"])
     )
     bridge = SerialBridge(serial_port, CONFIG["BAUD_RATE"], emit_console=False)
-    is_demo_hardware = serial_port.strip().upper() == "COM_FAKE"
+    is_demo_hardware = _is_demo_port(serial_port)
     # Five seconds at 20 ms is about 250 samples; keep the whole real round.
     hardware_buffer_size = (
         int(CONFIG["BUFFER_SIZE"])
@@ -451,8 +651,16 @@ def _run_hardware_tuning_loop(
     session = create_tuning_session(
         initial_pid=initial_pid,
         buffer_size=hardware_buffer_size,
+        initial_yaw_pid=_configured_initial_pid("YAW") if not is_yaw_axis else None,
     )
     start_time = time.time()
+    round_csv = (
+        None
+        if is_demo_hardware
+        else HardwareRoundCsvRecorder(
+            resolve_project_path("logs/round_csv"), tune_axis
+        )
+    )
     current_stream_round = [0]
 
     def llm_log_callback(label: str, message: str) -> None:
@@ -514,9 +722,54 @@ def _run_hardware_tuning_loop(
         f"Connected to {serial_port}.",
     )
 
+    if hasattr(bridge, "on_line"):
+        bridge.on_line = lambda line: _emit_log(event_sink, start_time, "serial", line) if line.startswith("#") else None
+
     motion_test_results: list[dict[str, Any]] = []
+    pid_snapshot: dict[str, dict[str, float]] = {}
+    tested_result = None
+    loaded_pid = None
+    stop_confirmation = "not_requested"
+
+    def start_next(pid, yaw=None, previous_yaw=None):
+        if controller is not None and controller.is_paused:
+            _pause_hardware(bridge, controller)
+        if not can_start_round(session.round_num, CONFIG["MAX_TUNING_ROUNDS"], controller):
+            raise RoundAdmissionClosed("stopped_by_user" if controller is not None and controller.should_stop else "max_rounds_reached")
+        return _send_next_round_commands(bridge, pid, yaw, previous_yaw)
+
     try:
-        last_heartbeat_at = time.monotonic()
+        if (
+            not is_demo_hardware
+            and getattr(bridge, "requires_hardware_preflight", False)
+        ):
+            _console(emit_console, "[INFO] 等待 OPS-9 定位链路就绪...")
+            ops_pose = _wait_for_ops_ready(bridge, timeout_sec=3.0)
+            if ops_pose is None:
+                session.completed_reason = "ops_not_ready"
+                message = "OPS-9 在串口连接后 3 秒内未返回 LINK=OK，未启动调参"
+                _console(emit_console, f"[ERROR] {message}")
+                _emit_lifecycle(event_sink, start_time, "error", message)
+                return {
+                    "elapsed_sec": now_elapsed(start_time),
+                    "tune_axis": tune_axis,
+                    **build_tuning_result(
+                        session,
+                        final_pid=dict(session.buffer.current_pid),
+                        stopped=False,
+                    ),
+                }
+            _console(
+                emit_console,
+                f"[INFO] OPS-9 就绪: X={ops_pose['x']:.2f} "
+                f"Y={ops_pose['y']:.2f} YAW={ops_pose['yaw']:.2f}",
+            )
+        bridge.send_command("PROTO VERSION")
+        _emit_log(event_sink, start_time, "cmd", "PROTO VERSION")
+        time.sleep(0.05)
+        bridge.send_command("MODE TUNE")
+        _emit_log(event_sink, start_time, "cmd", "MODE TUNE")
+        time.sleep(0.05)
         linear_limit = min(0.30, max(0.02, float(CONFIG["HARDWARE_OUTPUT_LIMIT_MPS"])))
         yaw_limit = min(
             0.80, max(0.02, float(CONFIG["HARDWARE_YAW_OUTPUT_LIMIT_RADPS"]))
@@ -531,22 +784,28 @@ def _run_hardware_tuning_loop(
             _emit_log(event_sink, start_time, "cmd", axis_limit_cmd)
             time.sleep(0.02)
 
-        # 先静默恢复其余轴的可靠参数；PID SET只装载参数，不会触发车辆运动。
-        result_log = str(CONFIG.get("PID_RESULT_LOG", "logs/pid_results.jsonl"))
+        # 三轴统一按续调策略装载；关闭续调时禁止任何旧日志参数静默回灌。
+        result_log = str(
+            resolve_project_path(CONFIG.get("PID_RESULT_LOG", "logs/pid_results.jsonl"))
+        )
         for saved_axis in ("X", "Y", "YAW"):
             if saved_axis == tune_axis:
                 continue
-            saved_mode = "hardware_yaw" if saved_axis == "YAW" else "hardware"
-            saved_pid = load_last_usable_pid(
-                result_log, get_pid_limits(saved_mode), saved_axis
-            )
+            saved_pid = None
+            if bool(CONFIG.get("HARDWARE_RESUME_LAST_PID", False)):
+                saved_mode = "hardware_yaw" if saved_axis == "YAW" else "hardware"
+                saved_pid = load_last_usable_pid(
+                    result_log, get_pid_limits(saved_mode), saved_axis
+                )
             if saved_pid is None:
-                continue
+                saved_pid = _configured_initial_pid(saved_axis)
             load_cmd = (
                 f"PID SET {saved_axis} {saved_pid['p']} "
                 f"{saved_pid['i']} {saved_pid['d']}"
             )
             bridge.send_command(load_cmd)
+            if saved_axis == "YAW":
+                session.current_yaw_pid = dict(saved_pid)
             _emit_log(event_sink, start_time, "cmd", load_cmd)
             _console(emit_console, f"[CMD] Loaded {saved_axis}: {load_cmd}")
             time.sleep(0.03)
@@ -565,12 +824,17 @@ def _run_hardware_tuning_loop(
         _emit_log(event_sink, start_time, "cmd", limit_cmd)
         _console(emit_console, f"[CMD] Sent: {limit_cmd}")
         time.sleep(0.05)
+        if not is_demo_hardware and getattr(bridge, "requires_hardware_preflight", False):
+            configured_snapshot = _read_pid_snapshot(bridge)
+            if set(configured_snapshot) != {"X", "Y", "YAW"}:
+                raise RuntimeError("missing PID configuration snapshot")
+            if not is_yaw_axis:
+                session.current_yaw_pid = dict(configured_snapshot["YAW"])
         if initial_pid:
             cmd = f"SET P:{initial_pid['p']} I:{initial_pid['i']} D:{initial_pid['d']}"
-            bridge.send_command(cmd)
+            start_next(initial_pid)
             _emit_log(event_sink, start_time, "cmd", cmd)
             _console(emit_console, f"[CMD] Initial PID: {cmd}")
-        time.sleep(1)
 
         _console(emit_console, "[INFO] 开始采集数据...")
         _emit_lifecycle(
@@ -587,11 +851,14 @@ def _run_hardware_tuning_loop(
         minimum_round_samples = min(20, max(3, int(CONFIG["BUFFER_SIZE"])))
         maximum_round_duration_sec = 7.0
         round_active = is_demo_hardware
+        round_requested = not is_demo_hardware
         round_complete = False
         round_sample_count = 0
+        round_pid = None
         round_started_at = time.monotonic()
         round_start_yaw: float | None = None
         round_stop_reason = "UNKNOWN"
+        last_timestamp = None
         tuning_stage = "P"
         stage_rounds = 0
         verification_passes = 0
@@ -602,48 +869,71 @@ def _run_hardware_tuning_loop(
         _console(emit_console, "[Stage] 进入 P 阶段：只调整 P，冻结 I/D")
 
         while session.round_num < CONFIG["MAX_TUNING_ROUNDS"]:
-            # Keep the STM32 host-loss watchdog alive only while this loop is healthy.
-            heartbeat_now = time.monotonic()
-            if heartbeat_now - last_heartbeat_at >= 0.5:
-                heartbeat_sender = getattr(bridge, "send_silent_command", bridge.send_command)
-                heartbeat_sender("PING")
-                last_heartbeat_at = heartbeat_now
-
             if controller is not None and controller.should_stop:
                 session.completed_reason = "stopped_by_user"
                 _console(emit_console, "\n[INFO] 用户停止")
                 _emit_lifecycle(event_sink, start_time, "stopped", "Hardware tuning stopped by user.")
                 break
 
-            if not wait_while_paused(controller):
-                session.completed_reason = "stopped_by_user"
-                _console(emit_console, "\n[INFO] 用户停止")
-                _emit_lifecycle(event_sink, start_time, "stopped", "Hardware tuning stopped by user.")
-                break
+            if controller is not None and controller.is_paused:
+                if round_csv is not None:
+                    round_csv.close()
+                _pause_hardware(bridge, controller)
+                session.buffer.reset()
+                start_next(session.buffer.current_pid, session.current_yaw_pid, session.current_yaw_pid)
+                round_active = is_demo_hardware
+                round_requested = not is_demo_hardware
+                round_complete = False
+                round_sample_count = 0
+                round_pid = None
+                round_started_at = last_sample_at = time.monotonic()
+                last_timestamp = None
+                continue
 
             line = bridge.read_line()
             if line:
                 if line.startswith("#"):
                     last_device_message = line
+                    # "# CAN" 覆盖 # CAN SAFETY（CAN 故障的具体判据）和
+                    # # CAN RECOVERED（自愈频率），两者是诊断 ROUND STOP
+                    # CAN FAULT 的唯一线索，不能过滤掉。
                     important_status = line.startswith(
-                        ("# STATUS", "# PID", "# ROUND", "# ERROR", "# OPS")
+                        ("# STATUS", "# PID", "# ROUND", "# ERROR", "# OPS", "# CAN")
                     )
                     if important_status:
                         _console(emit_console, f"[MCU] {line}")
                         _emit_log(event_sink, start_time, "mcu", line)
 
                     if line.startswith("# ROUND START"):
+                        if not round_requested or round_active:
+                            raise RuntimeError("unexpected or duplicate ROUND START")
+                        axis_match = re.search(r"AXIS=(\w+)", line)
+                        if axis_match and axis_match.group(1) != tune_axis:
+                            raise RuntimeError("ROUND START axis mismatch")
+                        session.buffer.reset()
+                        last_timestamp = None
+                        if round_csv is not None:
+                            csv_path = round_csv.start()
+                            _console(emit_console, f"[CSV] 本轮原始数据: {csv_path}")
+                            _emit_log(event_sink, start_time, "csv", str(csv_path))
+                        round_requested = False
                         round_active = True
                         round_complete = False
                         round_sample_count = 0
+                        round_pid = None
                         round_started_at = time.monotonic()
                         last_sample_at = round_started_at
                         round_start_yaw = None
                         round_stop_reason = "UNKNOWN"
-                    elif line.startswith("# ROUND STOP") and round_active:
+                    elif line.startswith("# ROUND STOP") and (
+                        round_active or round_requested
+                    ):
                         stop_payload = line.removeprefix("# ROUND STOP").strip()
                         stop_reason = stop_payload.split(maxsplit=1)[0] if stop_payload else "UNKNOWN"
                         round_stop_reason = stop_reason
+                        if round_csv is not None:
+                            round_csv.close()
+                        round_requested = False
                         round_active = False
                         if stop_reason in {"TARGET", "TIMEOUT"}:
                             if round_sample_count >= minimum_round_samples:
@@ -690,8 +980,18 @@ def _run_hardware_tuning_loop(
 
                 data = None if line.startswith("#") else bridge.parse_data(line)
                 if data:
-                    last_sample_at = time.monotonic()
                     if round_active:
+                        last_sample_at = time.monotonic()
+                        timestamp = float(data["timestamp"])
+                        if last_timestamp is not None and timestamp <= last_timestamp:
+                            raise RuntimeError("non-increasing round sample timestamp")
+                        last_timestamp = timestamp
+                        loaded_pid = {key: data[key] for key in ("p", "i", "d")}
+                        if round_pid is not None and loaded_pid != round_pid:
+                            raise RuntimeError("PID changed within the active round")
+                        round_pid = dict(loaded_pid)
+                        if round_csv is not None:
+                            round_csv.append(line)
                         if round_start_yaw is None and data.get("yaw") is not None:
                             round_start_yaw = float(data["yaw"])
                         safety_reason = _hardware_sample_safety_reason(
@@ -730,6 +1030,10 @@ def _run_hardware_tuning_loop(
                 round_active = False
                 round_complete = True
 
+            if round_requested and time.monotonic() - round_started_at >= 3.0:
+                session.completed_reason = "start_timeout"
+                break
+
             if (
                 round_active
                 and time.monotonic() - round_started_at >= maximum_round_duration_sec
@@ -763,6 +1067,8 @@ def _run_hardware_tuning_loop(
             evaluation = evaluate_completed_round(
                 session,
                 dict(session.buffer.current_pid),
+                tune_axis=tune_axis,
+                current_yaw_pid=session.current_yaw_pid,
             )
             _augment_hardware_round_metrics(
                 evaluation.metrics,
@@ -771,6 +1077,10 @@ def _run_hardware_tuning_loop(
                 stop_reason=round_stop_reason,
             )
             session.last_metrics.update(evaluation.metrics)
+            tested_result = {"round": evaluation.round_index, "axis": tune_axis,
+                             "pid": dict(evaluation.current_pid), "yaw_pid": dict(session.current_yaw_pid or {}),
+                             "metrics": dict(evaluation.metrics),
+                             "stop_reason": round_stop_reason, "verified": False}
             publish_event(
                 event_sink,
                 EVENT_ROUND_METRICS,
@@ -835,6 +1145,7 @@ def _run_hardware_tuning_loop(
                     )
                     if verification_passes >= required_verification_rounds:
                         session.completed_reason = "staged_validation_passed"
+                        tested_result["verified"] = True
                         _console(emit_console, "\n[SUCCESS] P、I、D 分阶段调参及最终验证完成！")
                         _emit_lifecycle(
                             event_sink,
@@ -857,24 +1168,22 @@ def _run_hardware_tuning_loop(
                     session.completed_reason = "max_rounds_reached"
                     break
 
-                cmd = (
-                    f"SET P:{evaluation.current_pid['p']} "
-                    f"I:{evaluation.current_pid['i']} D:{evaluation.current_pid['d']}"
+                cmd_list = start_next(
+                    evaluation.current_pid,
+                    session.current_yaw_pid if not is_yaw_axis else None,
+                    session.current_yaw_pid if not is_yaw_axis else None,
                 )
-                clear_input = getattr(bridge, "clear_input_buffer", None)
-                if callable(clear_input):
-                    clear_input()
-                bridge.send_command(cmd)
                 last_sample_at = time.monotonic()
-                last_heartbeat_at = last_sample_at
                 last_device_message = "waiting for verification round"
                 round_active = is_demo_hardware
+                round_requested = not is_demo_hardware
                 round_complete = False
                 round_sample_count = 0
+                round_pid = None
                 round_started_at = last_sample_at
-                _emit_log(event_sink, start_time, "cmd", cmd)
-                _console(emit_console, f"[CMD] Sent: {cmd}")
-                time.sleep(1)
+                for cmd in cmd_list:
+                    _emit_log(event_sink, start_time, "cmd", cmd)
+                    _console(emit_console, f"[CMD] Sent: {cmd}")
                 continue
 
             if evaluation.rollback_pid:
@@ -887,6 +1196,7 @@ def _run_hardware_tuning_loop(
                     evaluation,
                     evaluation.rollback_pid,
                     target_round=int(evaluation.best_result["round"]) if evaluation.best_result else None,
+                    rollback_yaw_pid=evaluation.rollback_yaw_pid,
                 )
                 _console(emit_console, f"[Rollback] {rollback_message}")
                 publish_event(
@@ -898,30 +1208,32 @@ def _run_hardware_tuning_loop(
                     reason=rollback_message,
                 )
 
-                cmd = (
-                    f"SET P:{evaluation.rollback_pid['p']} "
-                    f"I:{evaluation.rollback_pid['i']} D:{evaluation.rollback_pid['d']}"
-                )
+                previous_yaw = dict(session.current_yaw_pid or {})
+                apply_rollback(session, evaluation.rollback_pid, evaluation.rollback_yaw_pid)
                 time.sleep(0.05)
-                clear_input = getattr(bridge, "clear_input_buffer", None)
-                if callable(clear_input):
-                    clear_input()
-                bridge.send_command(cmd)
+                cmd_list = start_next(
+                    evaluation.rollback_pid,
+                    evaluation.rollback_yaw_pid if not is_yaw_axis else None,
+                    previous_yaw if not is_yaw_axis else None,
+                )
                 last_sample_at = time.monotonic()
-                last_heartbeat_at = last_sample_at
                 last_device_message = "waiting for rollback round"
                 round_active = is_demo_hardware
+                round_requested = not is_demo_hardware
                 round_complete = False
                 round_sample_count = 0
+                round_pid = None
                 round_started_at = last_sample_at
-                _emit_log(event_sink, start_time, "cmd", cmd)
-                _console(emit_console, f"[CMD] Sent: {cmd}")
-                apply_rollback(session, evaluation.rollback_pid)
+                for cmd in cmd_list:
+                    _emit_log(event_sink, start_time, "cmd", cmd)
+                    _console(emit_console, f"[CMD] Sent: {cmd}")
                 stage_rounds += 1
-                time.sleep(1)
                 continue
 
-            prompt_data = session.buffer.to_prompt_data()
+            prompt_data = session.buffer.to_prompt_data(
+                tune_axis=tune_axis,
+                current_yaw_pid=session.current_yaw_pid,
+            )
             history_text = session.history.to_prompt_text()
             current_stream_round[0] = evaluation.round_index
             _emit_lifecycle(
@@ -961,6 +1273,10 @@ def _run_hardware_tuning_loop(
                 evaluation.metrics.get("speed_saturation_ratio", 0.0)
             )
 
+            allow_yaw_edit = _yaw_adjust_allowed(
+                evaluation.metrics, tune_axis, tuning_stage
+            )
+            previous_yaw = dict(session.current_yaw_pid or {})
             decision = finalize_decision(
                 session,
                 evaluation,
@@ -972,6 +1288,8 @@ def _run_hardware_tuning_loop(
                     and float(evaluation.metrics.get("steady_state_error", 0.0))
                     <= hardware_steady_error_limit
                 ),
+                current_yaw_pid=session.current_yaw_pid,
+                allow_yaw_adjust=allow_yaw_edit,
             )
             publish_event(
                 event_sink,
@@ -987,6 +1305,13 @@ def _run_hardware_tuning_loop(
                 emit_console,
                 f"\n[Action] {decision.action} -> P={decision.safe_pid['p']}, I={decision.safe_pid['i']}, D={decision.safe_pid['d']}",
             )
+            if decision.safe_yaw_pid and not is_yaw_axis:
+                _console(
+                    emit_console,
+                    f"[YawHold] -> P={decision.safe_yaw_pid['p']}, "
+                    f"I={decision.safe_yaw_pid['i']}, D={decision.safe_yaw_pid['d']}"
+                    f" ({'allow' if allow_yaw_edit else 'frozen'})",
+                )
             if decision.guardrail_notes:
                 _console(emit_console, f"[Guardrail] {'; '.join(decision.guardrail_notes)}")
             if decision.fallback_used:
@@ -1007,25 +1332,24 @@ def _run_hardware_tuning_loop(
                     f"[Stage] {old_stage} 阶段结束（{reason}），进入 {tuning_stage} 阶段",
                 )
 
-            cmd = (
-                f"SET P:{decision.safe_pid['p']} "
-                f"I:{decision.safe_pid['i']} D:{decision.safe_pid['d']}"
+            safe_yaw = decision.safe_yaw_pid if not is_yaw_axis else None
+            cmd_list = start_next(
+                decision.safe_pid,
+                safe_yaw,
+                previous_yaw if not is_yaw_axis else None,
             )
-            clear_input = getattr(bridge, "clear_input_buffer", None)
-            if callable(clear_input):
-                clear_input()
-            bridge.send_command(cmd)
             last_sample_at = time.monotonic()
-            last_heartbeat_at = last_sample_at
             last_device_message = "waiting for next tuning round"
             round_active = is_demo_hardware
+            round_requested = not is_demo_hardware
             round_complete = False
             round_sample_count = 0
+            round_pid = None
             round_started_at = last_sample_at
-            _emit_log(event_sink, start_time, "cmd", cmd)
-            _console(emit_console, f"[CMD] Sent: {cmd}")
+            for cmd in cmd_list:
+                _emit_log(event_sink, start_time, "cmd", cmd)
+                _console(emit_console, f"[CMD] Sent: {cmd}")
 
-            time.sleep(1)
 
         if (
             session.completed_reason == "staged_validation_passed"
@@ -1034,7 +1358,7 @@ def _run_hardware_tuning_loop(
             and not is_demo_hardware
         ):
             motion_test_results = _run_post_tune_motion_tests(
-                bridge, emit_console=emit_console
+                bridge, emit_console=emit_console, controller=controller
             )
             if motion_test_results and not all(
                 bool(item.get("passed")) for item in motion_test_results
@@ -1044,6 +1368,12 @@ def _run_hardware_tuning_loop(
                     "[WARN] PID验证已通过，但横移/旋转动作验收存在失败项，请检查运动学或机械状态。",
                 )
 
+    except RoundAdmissionClosed as exc:
+        session.completed_reason = str(exc)
+    except (ConnectionError, TimeoutError, RuntimeError, ValueError) as exc:
+        session.completed_reason = "hardware_error"
+        _emit_lifecycle(event_sink, start_time, "error", str(exc))
+        _console(emit_console, f"[ERROR] {exc}")
     except KeyboardInterrupt:
         session.completed_reason = "keyboard_interrupt"
         _console(emit_console, "\n[INFO] 用户停止")
@@ -1054,9 +1384,18 @@ def _run_hardware_tuning_loop(
             "Hardware tuning interrupted by keyboard.",
         )
     finally:
-        bridge.send_command("STOP")
-        time.sleep(0.05)
-        bridge.disconnect()
+        try:
+            stop_confirmation = _confirm_hardware_stop(bridge)
+            if not is_demo_hardware:
+                pid_snapshot = _read_pid_snapshot(bridge)
+            bridge.send_command("MODE WORK")
+        except Exception as exc:
+            stop_confirmation = "unconfirmed" if stop_confirmation == "not_requested" else stop_confirmation
+            _emit_log(event_sink, start_time, "error", f"Cleanup: {exc}")
+        finally:
+            if round_csv is not None:
+                round_csv.close()
+            bridge.disconnect()
         _emit_lifecycle(
             event_sink,
             start_time,
@@ -1064,16 +1403,61 @@ def _run_hardware_tuning_loop(
             f"Hardware tuning finished in {now_elapsed(start_time):.1f}s.",
         )
 
-    return {
+    final_pid = dict(tested_result["pid"] if tested_result else session.buffer.current_pid)
+    result = {
         "elapsed_sec": now_elapsed(start_time),
         "tune_axis": tune_axis,
+        "output_limit": hardware_output_limit,
+        "output_unit": "rad/s" if is_yaw_axis else "m/s",
+        "pid_snapshot": pid_snapshot,
+        "suggested_pid": dict(session.buffer.current_pid),
+        "loaded_pid": pid_snapshot.get(tune_axis, loaded_pid),
+        "tested_result": tested_result,
+        "verified_pid": dict(tested_result["pid"]) if tested_result and tested_result["verified"] else None,
+        "stop_confirmation": stop_confirmation,
         "motion_tests": motion_test_results,
         **build_tuning_result(
             session,
-            final_pid=dict(session.buffer.current_pid),
+            final_pid=final_pid,
             stopped=bool(controller.should_stop) if controller is not None else False,
         ),
     }
+    if tested_result:
+        result["final_metrics"] = dict(tested_result["metrics"])
+        result["final_yaw_pid"] = dict(tested_result["yaw_pid"])
+    round_history = [
+        {
+            "round": item.get("round"),
+            "pid": item.get("pid", {}),
+            "metrics": item.get("metrics", {}),
+            "analysis": item.get("analysis", ""),
+        }
+        for item in session.history.history
+    ]
+    summary_payload = {
+        "tune_axis": tune_axis,
+        "rounds_completed": result["rounds_completed"],
+        "completed_reason": result["completed_reason"],
+        "final_pid": final_pid,
+        "pid_snapshot": pid_snapshot,
+        "output_limit": hardware_output_limit,
+        "output_unit": result["output_unit"],
+        "final_metrics": result["final_metrics"],
+        "motion_tests": motion_test_results,
+        "round_history": round_history,
+    }
+    summarize = getattr(tuner, "summarize_tuning_session", None)
+    ai_summary = (
+        summarize(summary_payload)
+        if callable(summarize) and int(result["rounds_completed"] or 0) > 0
+        else None
+    )
+    result["ai_summary"] = (
+        ai_summary
+        if isinstance(ai_summary, dict)
+        else build_local_tuning_summary(result, round_history)
+    )
+    return result
 
 
 def _run_hardware_tuning_with_tui(
@@ -1148,8 +1532,10 @@ def run_hardware_tuner(
 
     tune_axis = _normalize_hardware_axis(CONFIG.get("HARDWARE_TUNE_AXIS", "Y"))
     limit_mode = "hardware_yaw" if tune_axis == "YAW" else "hardware"
-    if initial_pid is None and bool(CONFIG.get("HARDWARE_RESUME_LAST_PID", True)):
-        result_log = str(CONFIG.get("PID_RESULT_LOG", "logs/pid_results.jsonl"))
+    if initial_pid is None and bool(CONFIG.get("HARDWARE_RESUME_LAST_PID", False)):
+        result_log = str(
+            resolve_project_path(CONFIG.get("PID_RESULT_LOG", "logs/pid_results.jsonl"))
+        )
         initial_pid = load_last_usable_pid(
             result_log, get_pid_limits(limit_mode), tune_axis
         )
@@ -1159,14 +1545,11 @@ def run_hardware_tuner(
                 f"P={initial_pid['p']} I={initial_pid['i']} D={initial_pid['d']}"
             )
         else:
-            initial_pid = {
-                "p": 0.01 if tune_axis == "YAW" else 0.001,
-                "i": 0.0,
-                "d": 0.0,
-            }
+            initial_pid = _configured_initial_pid(tune_axis)
             print(
                 f"[INFO] 未找到可靠 {tune_axis} 轴历史 PID，"
-                f"使用安全初值 P={initial_pid['p']} I=0 D=0"
+                f"使用显式配置初值 P={initial_pid['p']} "
+                f"I={initial_pid['i']} D={initial_pid['d']}"
             )
 
     result: dict[str, Any]
@@ -1183,7 +1566,12 @@ def run_hardware_tuner(
 
     try:
         saved_path = append_pid_result(
-            result, str(CONFIG.get("PID_RESULT_LOG", "logs/pid_results.jsonl"))
+            result,
+            str(
+                resolve_project_path(
+                    CONFIG.get("PID_RESULT_LOG", "logs/pid_results.jsonl")
+                )
+            ),
         )
         if saved_path is not None:
             print(f"[INFO] 本次最终 PID 已追加保存到: {saved_path}")

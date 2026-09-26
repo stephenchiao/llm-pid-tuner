@@ -454,8 +454,10 @@ class LLMTuner:
     def _sanitize_result(self, data: Dict[str, Any]) -> Dict[str, Any]:
         sanitized = dict(data)
 
-        for key in ("p", "i", "d"):
+        for key in ("p", "i", "d", "yaw_p", "yaw_i", "yaw_d"):
             value = sanitized.get(key)
+            if value is None:
+                continue
             try:
                 numeric = float(value)  # type: ignore[arg-type]
             except (TypeError, ValueError):
@@ -466,6 +468,24 @@ class LLMTuner:
                 sanitized.pop(key, None)
             else:
                 sanitized[key] = numeric
+
+        nested = sanitized.get("yaw_pid")
+        if isinstance(nested, dict):
+            cleaned_nested: Dict[str, Any] = {}
+            for key in ("p", "i", "d"):
+                value = nested.get(key)
+                if value is None:
+                    continue
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(numeric) and numeric >= 0:
+                    cleaned_nested[key] = numeric
+            if cleaned_nested:
+                sanitized["yaw_pid"] = cleaned_nested
+            else:
+                sanitized.pop("yaw_pid", None)
 
         if "status" in sanitized:
             status = str(sanitized["status"]).strip().upper()
@@ -536,3 +556,50 @@ class LLMTuner:
         except Exception as exc:
             self._emit_log("error", f"[ERROR] LLM request failed after retries: {exc}")
             return None
+
+    def summarize_tuning_session(
+        self, session_data: Dict[str, Any]
+    ) -> Optional[Dict[str, str]]:
+        """在硬件已停车后生成一次简短会话总结，不请求新的PID参数。"""
+        system_prompt = (
+            "你是PID调试记录员。根据给定的轮次指标和已执行的调参分析，"
+            "简要总结调参过程并评价最终结果。不要输出思维链，不要建议超出安全限幅的参数，"
+            "不要把中断或失败会话评价为成功。仅输出JSON，字段必须为"
+            "process_summary、evaluation、recommendation；每项不超过300个中文字符。"
+        )
+        user_prompt = json.dumps(session_data, ensure_ascii=False, default=str)
+        openai_msgs: List[Any] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        anthropic_msgs: List[Any] = [{"role": "user", "content": user_prompt}]
+
+        try:
+            content = self._call_with_retry(
+                self._execute_request,
+                openai_msgs,
+                anthropic_msgs,
+                system_prompt,
+            )
+            for candidate in self._extract_json_candidates(content):
+                try:
+                    parsed = json.loads(candidate)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if not isinstance(parsed, dict):
+                    continue
+                summary = {
+                    key: str(parsed.get(key, "")).strip()[:600]
+                    for key in (
+                        "process_summary",
+                        "evaluation",
+                        "recommendation",
+                    )
+                }
+                if summary["process_summary"] and summary["evaluation"]:
+                    summary["source"] = "llm"
+                    return summary
+            self._emit_log("warn", "[WARN] LLM session summary was not valid JSON.")
+        except Exception as exc:
+            self._emit_log("error", f"[ERROR] LLM session summary failed: {exc}")
+        return None
