@@ -8,7 +8,7 @@ def configuration_reply(command):
     if command == "PROTO VERSION":
         def compatible(line):
             match = re.match(r"# PROTO VERSION=(\d+)\b", line)
-            return bool(match and int(match.group(1)) == 4 and "MODES=WORK,TUNE,PLOT" in line)
+            return bool(match and int(match.group(1)) == 4 and "MODES=WORK,TUNE" in line.split())
         return compatible
     if command.startswith("MODE "):
         return lambda line: line.split()[:3] == ["#", "MODE", parts[1]]

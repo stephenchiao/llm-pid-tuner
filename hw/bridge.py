@@ -98,6 +98,8 @@ class SerialBridge:
         self.pending_lines = deque()
         self.is_demo = _is_demo_port(port)
         self.on_line = None
+        self.on_io = None
+        self._rx_fragment = b""
 
     def connect(self) -> bool:
         try:
@@ -108,20 +110,30 @@ class SerialBridge:
                     print(f"[INFO] Connected to virtual hardware feed: {DEMO_SERIAL_PORT}")
                 return True
 
-            # Short reads keep the 0.5 s host heartbeat and safety timeout responsive.
-            self.serial = serial.Serial(self.port, self.baudrate, timeout=0.2, write_timeout=1.0)
+            # Configure modem lines before opening; do not toggle them as a reset.
+            self.serial = serial.Serial(port=None, baudrate=self.baudrate,
+                                        timeout=0.2, write_timeout=1.0,
+                                        xonxoff=False, rtscts=False, dsrdtr=False)
+            self.serial.dtr = False
+            self.serial.rts = False
+            self.serial.port = self.port
+            self.trace("OPEN", f"port={self.port} baud={self.baudrate} DTR=0 RTS=0")
+            self.serial.open()
             if not self._claim_com_host():
-                self.serial.close()
-                self.serial = None
-                if self.emit_console:
-                    print(f"[ERROR] Connection failed: {self.last_error}")
-                return False
+                raise ConnectionError(self.last_error)
             self.last_error = ""
             if self.emit_console:
                 print(f"[INFO] Connected to {self.port}")
             return True
         except Exception as e:
             self.last_error = str(e)
+            self.trace("ERROR", self.last_error)
+            if self.serial and self.serial.is_open:
+                try:
+                    from hw.diagnostics import capture_failure
+                    capture_failure(self)
+                except Exception as diagnostic_error:
+                    self.trace("ERROR", f"failure capture: {diagnostic_error}")
             self.disconnect()
             if self.emit_console:
                 print(f"[ERROR] Connection failed: {e}")
@@ -129,6 +141,7 @@ class SerialBridge:
 
     def _claim_com_host(self) -> bool:
         """真机连接后先取得 COM 所有权；BUSY/超时都禁止继续调参。"""
+        self.trace("STAGE", "initial_stop")
         self.send_silent_command("STOP")
         # STOP 会清除固件待执行队列，确认后才能提交新的握手命令。
         deadline = time.monotonic() + HOST_LINK_TIMEOUT_SEC
@@ -140,19 +153,46 @@ class SerialBridge:
         else:
             self.last_error = "timeout waiting for STOP acknowledgement"
             return False
+        self.trace("STAGE", "claim_com")
         self.send_silent_command("HOST LINK COM")
         deadline = time.monotonic() + HOST_LINK_TIMEOUT_SEC
         while time.monotonic() < deadline:
             line = self.read_line()
             # 按完整 token 判断，兼容旧版及 HEARTBEAT 等扩展字段。
             if line and line.split()[:5] == ["#", "HOST", "LINK", "COM", "OK"]:
+                # Claim ownership first so CAN diagnostics are available on failure.
+                # Motion remains blocked until the stop frames are sent and CAN is ready.
+                self.wait_stopped()
+                self.checkpoint("after_host_link")
                 return True
         self.last_error = "timeout waiting for # HOST LINK COM OK"
         return False
 
+    def trace(self, direction, text):
+        if self.on_io is not None:
+            self.on_io(direction, text)
+
+    def checkpoint(self, stage):
+        if not self.is_demo:
+            from hw.diagnostics import wait_healthy
+            wait_healthy(self, stage)
+
+    def wait_stopped(self, timeout=2.0):
+        from hw.diagnostics import fields
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            line = self.request("MOTOR STOP STATUS", lambda text: text.startswith("# MOTOR STOP STATE="),
+                                timeout=min(1.0, max(0.05, deadline - time.monotonic())))
+            data = fields(line)
+            if data.get("STATE") == "SENT" and data.get("EVIDENCE") == "CAN_TX_ONLY":
+                return
+            time.sleep(0.1)
+        raise TimeoutError("STOP acknowledged but CAN stop-frame delivery is unconfirmed")
+
     def disconnect(self) -> None:
         if self.serial:
             self.serial.close()
+            self.trace("CLOSE", self.port)
             self.serial = None
 
     def _read_device_line(self):
@@ -162,7 +202,14 @@ class SerialBridge:
             payload = self.serial.readline()
             if not payload:
                 return None
-            line = payload.decode("utf-8", errors="strict").strip()
+            self._rx_fragment += payload
+            if len(self._rx_fragment) > 4096:
+                raise ValueError("serial line exceeds 4096 bytes")
+            if not self._rx_fragment.endswith(b"\n"):
+                return None
+            line = self._rx_fragment.decode("utf-8", errors="strict").strip()
+            self._rx_fragment = b""
+            self.trace("RX", line)
             if self.on_line is not None:
                 self.on_line(line)
             return line
@@ -179,6 +226,7 @@ class SerialBridge:
         if not self.serial or not self.serial.is_open:
             raise ConnectionError("serial port is closed")
         payload = f"{cmd}\n".encode("utf-8")
+        self.trace("TX", cmd)
         try:
             count = self.serial.write(payload)
             if count != len(payload):
@@ -190,7 +238,7 @@ class SerialBridge:
             print(f"[CMD] Sent: {cmd}")
         return True
 
-    def request(self, command, predicate, timeout=1.5):
+    def request(self, command, predicate, timeout=1.5, *, tolerate_errors=False):
         """One serial reader; unrelated replies remain available to the loop."""
         self._write(command)
         deadline = time.monotonic() + timeout
@@ -198,7 +246,7 @@ class SerialBridge:
             line = self._read_device_line()
             if not line:
                 continue
-            if line.startswith(("# ERROR", "# MOTION STOP SAFETY", "# CAN SAFETY", "# CAN FEEDBACK LOST")):
+            if not tolerate_errors and line.startswith(("# ERROR", "# MOTION STOP SAFETY", "# CAN SAFETY", "# CAN FEEDBACK LOST")):
                 raise RuntimeError(line)
             if predicate(line):
                 return line

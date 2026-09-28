@@ -18,7 +18,19 @@ class FakeSerial:
 
     def write(self, payload):
         self.writes.append(bytes(payload))
+        if payload == b"MOTOR STOP STATUS\n":
+            self.responses.insert(0, "# MOTOR STOP STATE=SENT MASK=0x0F FRESH=0 EVIDENCE=CAN_TX_ONLY")
+        elif payload == b"CAN STATUS\n":
+            self.responses.extend([
+                f"# CAN STATE=2 TX_OK={len(self.writes)} TX_ERR=0 TX_TIMEOUT=0",
+                "# CAN READY=1 MASK=0x0F TX_FAULT=0", "# CAN ESR=0x0"])
+        elif payload == b"MOTOR FEEDBACK\n":
+            self.responses.extend(f"# MOTOR FEEDBACK ID={i} VALID=1 RPM=0 AGE_MS=10 SEQ={len(self.writes)}" for i in range(1, 5))
         return len(payload)
+
+    def open(self):
+        assert self.dtr is False and self.rts is False
+        self.is_open = True
 
     def readline(self):
         if self.responses:
@@ -66,7 +78,8 @@ class DemoSerialBridgeTests(unittest.TestCase):
             "hw.bridge.HOST_LINK_TIMEOUT_SEC", 0.01
         ):
             self.assertFalse(SerialBridge("COM9", 115200, emit_console=False).connect())
-        self.assertEqual(device.writes, [b"STOP\n"])
+        self.assertNotIn(b"HOST LINK COM\n", device.writes)
+        self.assertEqual(device.writes[0], b"STOP\n")
 
     def test_parse_extended_hardware_csv_pose_fields(self):
         bridge = SerialBridge("COM9", 115200, emit_console=False)
@@ -109,7 +122,18 @@ class DemoSerialBridgeTests(unittest.TestCase):
         with patch("hw.bridge.serial.Serial", return_value=device):
             bridge = SerialBridge("COM9", 115200, emit_console=False)
             self.assertTrue(bridge.connect())
+        self.assertEqual(device.writes[:3], [b"STOP\n", b"HOST LINK COM\n", b"MOTOR STOP STATUS\n"])
+
+    def test_unconfirmed_stop_is_diagnosed_after_claim_without_starting_motion(self):
+        device = FakeSerial(["# STOP MODE=WORK HOST=WAITING", "# HOST LINK COM OK"])
+        with patch("hw.bridge.serial.Serial", return_value=device), patch.object(
+            SerialBridge, "wait_stopped", side_effect=TimeoutError("stop not sent")
+        ), patch("hw.diagnostics.time.sleep"):
+            bridge = SerialBridge("COM9", 115200, emit_console=False)
+            self.assertFalse(bridge.connect())
         self.assertEqual(device.writes[:2], [b"STOP\n", b"HOST LINK COM\n"])
+        self.assertIn(b"CAN STATUS\n", device.writes)
+        self.assertNotIn(b"MODE TUNE\n", device.writes)
 
 
 class SelectSerialPortTests(unittest.TestCase):

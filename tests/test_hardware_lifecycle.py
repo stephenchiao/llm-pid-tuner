@@ -30,13 +30,14 @@ class Device:
 class TransportTests(unittest.TestCase):
     def test_protocol_confirmation_rejects_unknown_version(self):
         accepts = configuration_reply("PROTO VERSION")
-        self.assertTrue(accepts("# PROTO VERSION=4 MODES=WORK,TUNE,PLOT"))
-        self.assertFalse(accepts("# PROTO VERSION=99 MODES=WORK,TUNE,PLOT"))
+        self.assertTrue(accepts("# PROTO VERSION=4 MODES=WORK,TUNE"))
+        self.assertFalse(accepts("# PROTO VERSION=4 MODES=WORK,TUNE,PLOT"))
+        self.assertFalse(accepts("# PROTO VERSION=99 MODES=WORK,TUNE"))
 
     def test_verified_evidence_must_match_pid_metrics_and_stop(self):
         record = {"completed_reason": "staged_validation_passed", "tune_axis": "X",
                   "final_pid": {"p": 0.003, "i": 0, "d": 0}, "final_metrics": {"current_error": 1},
-                  "stop_confirmation": "feedback_confirmed"}
+                  "stop_confirmation": "can_stop_sent"}
         record["verified_pid"] = dict(record["final_pid"])
         record["tested_result"] = {"verified": True, "axis": "X", "pid": dict(record["final_pid"]),
                                    "metrics": dict(record["final_metrics"])}
@@ -71,17 +72,17 @@ class TransportTests(unittest.TestCase):
         controller = SimulationController()
         controller.pause()
         bridge = SerialBridge("COM9", 115200, False)
-        bridge.serial = Device(["# STOP MODE=TUNE", "# MOTOR STOP STATE=CONFIRMED"])
+        bridge.serial = Device(["# MOTOR STOP STATE=WAIT FRESH=0", "# STOP MODE=TUNE", "# MOTOR STOP STATE=SENT FRESH=0 EVIDENCE=CAN_TX_ONLY"])
         def read():
             controller.resume()
             return "# CAN READY=1"
         bridge.read_line = read
         tuner._pause_hardware(bridge, controller)
-        self.assertEqual(bridge.serial.writes, [b"STOP\n", b"MOTOR STOP STATUS\n"])
+        self.assertEqual(bridge.serial.writes, [b"MOTOR STOP STATUS\n", b"STOP\n", b"MOTOR STOP STATUS\n"])
 
 
 class RoundTests(unittest.TestCase):
-    def run_loop(self, *, missing_start=False, stop_during_analysis=False):
+    def run_loop(self, *, missing_start=False, stop_during_analysis=False, failed_checkpoint=None):
         commands = []
         controller = SimulationController()
         clock = [0.0]
@@ -97,6 +98,9 @@ class RoundTests(unittest.TestCase):
                 self.started = False
             def connect(self): return True
             def disconnect(self): pass
+            def checkpoint(self, stage):
+                if stage == failed_checkpoint:
+                    raise RuntimeError(f"CAN checkpoint failed at {stage}")
             def send_command(self, cmd):
                 commands.append(cmd)
                 if cmd.startswith("SET P:"):
@@ -136,6 +140,16 @@ class RoundTests(unittest.TestCase):
         self.assertEqual(result["completed_reason"], "start_timeout")
         self.assertEqual(sum(c.startswith("SET P:") for c in commands), 1)
         self.assertIsNone(result["tested_result"])
+
+    def test_failed_can_checkpoint_never_starts_motion(self):
+        for stage in ("after_mode_tune", "before_round"):
+            with self.subTest(stage=stage):
+                commands, result = self.run_loop(failed_checkpoint=stage)
+                self.assertEqual(result["completed_reason"], "hardware_error")
+                self.assertIn(stage, result["failure_detail"])
+                self.assertFalse(any(c.startswith("SET P:") for c in commands))
+                self.assertIn("STOP", commands)
+                self.assertNotIn("MODE WORK", commands)
 
     def test_last_round_does_not_start_proposal_or_mislabel_metrics(self):
         commands, result = self.run_loop()

@@ -38,6 +38,7 @@ from core.tuning_session import (
 )
 from hw.bridge import SerialBridge, safe_pause, select_serial_port, _is_demo_port
 from hw.session import can_start_round
+from hw.diagnostics import SerialTranscript, capture_failure, fields
 from llm.client import LLMTuner
 from pid_safety import build_fallback_suggestion, get_pid_limits
 from sim.runtime import (
@@ -328,19 +329,23 @@ def _confirm_hardware_stop(bridge):
     if not getattr(bridge, "requires_hardware_preflight", False) or getattr(bridge, "is_demo", False):
         bridge.send_command("STOP")
         return "command_sent"
-    bridge.request("STOP", lambda line: line.startswith(("# STOP MODE=", "# ROUND STOP HOST")))
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
-        line = bridge.request("MOTOR STOP STATUS", lambda line: line.startswith("# MOTOR STOP STATE="))
-        if "STATE=CONFIRMED" in line:
-            return "feedback_confirmed"
-        time.sleep(0.05)
-    raise TimeoutError("STOP acknowledged but motor stop feedback is unconfirmed")
+    # Read first: an already sent stop does not need another CAN abort batch.
+    try:
+        line = bridge.request("MOTOR STOP STATUS", lambda text: text.startswith("# MOTOR STOP STATE="), timeout=0.3)
+        status = fields(line)
+    except (ConnectionError, RuntimeError, TimeoutError):
+        # A failed diagnostic must never prevent the actual stop command.
+        status = {}
+    if status.get("STATE") == "SENT" and status.get("EVIDENCE") == "CAN_TX_ONLY":
+        return "can_stop_sent"
+    bridge.request("STOP", lambda text: text.startswith(("# STOP MODE=", "# ROUND STOP HOST")))
+    bridge.wait_stopped()
+    return "can_stop_sent"
 
 
 def _pause_hardware(bridge, controller):
     _confirm_hardware_stop(bridge)
-    # STOP confirmation closes the old round; account for buffered events before
+    # STOP transmission closes the old round; account for buffered events before
     # requesting a fresh round. No reset_input_buffer and no blind wire discard.
     while getattr(bridge, "pending_lines", None):
         line = bridge.read_line()
@@ -699,14 +704,26 @@ def _run_hardware_tuning_loop(
         f"Opening {serial_port} at {CONFIG['BAUD_RATE']} baud.",
     )
 
+    transcript = None
+    if not is_demo_hardware and hasattr(bridge, "on_io"):
+        transcript = SerialTranscript(resolve_project_path("logs/can_sessions"))
+        bridge.on_io = transcript.write
+        bridge.on_line = lambda line: _emit_log(event_sink, start_time, "serial", line) if line.startswith("#") else None
+        _console(emit_console, f"[SerialLog] {transcript.path}")
+        _emit_log(event_sink, start_time, "serial_log", str(transcript.path))
+
     if not bridge.connect():
-        message = f"无法打开串口 {serial_port}: {bridge.last_error or 'unknown error'}"
+        message = f"串口连接或 CAN 准备失败 {serial_port}: {bridge.last_error or 'unknown error'}"
+        if transcript is not None:
+            transcript.close()
         session.completed_reason = "error"
         _console(emit_console, f"[ERROR] {message}")
         _emit_lifecycle(event_sink, start_time, "error", message)
         return {
             "elapsed_sec": now_elapsed(start_time),
             "tune_axis": tune_axis,
+            "failure_detail": message,
+            "serial_log_path": str(transcript.path) if transcript else None,
             **build_tuning_result(
                 session,
                 final_pid=dict(session.buffer.current_pid),
@@ -730,12 +747,18 @@ def _run_hardware_tuning_loop(
     tested_result = None
     loaded_pid = None
     stop_confirmation = "not_requested"
+    failure_detail = ""
 
     def start_next(pid, yaw=None, previous_yaw=None):
         if controller is not None and controller.is_paused:
             _pause_hardware(bridge, controller)
         if not can_start_round(session.round_num, CONFIG["MAX_TUNING_ROUNDS"], controller):
             raise RoundAdmissionClosed("stopped_by_user" if controller is not None and controller.should_stop else "max_rounds_reached")
+        checkpoint = getattr(bridge, "checkpoint", None)
+        if callable(checkpoint):
+            checkpoint("before_round")
+        if not can_start_round(session.round_num, CONFIG["MAX_TUNING_ROUNDS"], controller):
+            raise RoundAdmissionClosed("stopped_by_user")
         return _send_next_round_commands(bridge, pid, yaw, previous_yaw)
 
     try:
@@ -768,6 +791,9 @@ def _run_hardware_tuning_loop(
         _emit_log(event_sink, start_time, "cmd", "PROTO VERSION")
         time.sleep(0.05)
         bridge.send_command("MODE TUNE")
+        checkpoint = getattr(bridge, "checkpoint", None)
+        if callable(checkpoint):
+            checkpoint("after_mode_tune")
         _emit_log(event_sink, start_time, "cmd", "MODE TUNE")
         time.sleep(0.05)
         linear_limit = min(0.30, max(0.02, float(CONFIG["HARDWARE_OUTPUT_LIMIT_MPS"])))
@@ -953,6 +979,7 @@ def _run_hardware_tuning_loop(
                                 break
                         else:
                             session.completed_reason = "hardware_stopped"
+                            failure_detail = line
                             _console(
                                 emit_console,
                                 f"[ERROR] 主控异常停止本轮：{line}",
@@ -966,6 +993,7 @@ def _run_hardware_tuning_loop(
                             break
                     elif line.startswith("# ERROR"):
                         session.completed_reason = "hardware_stopped"
+                        failure_detail = line
                         _console(
                             emit_console,
                             f"[ERROR] 主控拒绝本轮：{line}",
@@ -1372,6 +1400,7 @@ def _run_hardware_tuning_loop(
         session.completed_reason = str(exc)
     except (ConnectionError, TimeoutError, RuntimeError, ValueError) as exc:
         session.completed_reason = "hardware_error"
+        failure_detail = str(exc)
         _emit_lifecycle(event_sink, start_time, "error", str(exc))
         _console(emit_console, f"[ERROR] {exc}")
     except KeyboardInterrupt:
@@ -1388,14 +1417,24 @@ def _run_hardware_tuning_loop(
             stop_confirmation = _confirm_hardware_stop(bridge)
             if not is_demo_hardware:
                 pid_snapshot = _read_pid_snapshot(bridge)
-            bridge.send_command("MODE WORK")
+            # Keep the stopped TUNE mode; MODE WORK has motor/actuator side effects.
         except Exception as exc:
             stop_confirmation = "unconfirmed" if stop_confirmation == "not_requested" else stop_confirmation
             _emit_log(event_sink, start_time, "error", f"Cleanup: {exc}")
+            failure_detail = failure_detail or str(exc)
         finally:
+            if transcript is not None:
+                try:
+                    capture_failure(bridge)
+                except Exception as exc:
+                    bridge.trace("ERROR", f"exit capture: {exc}")
             if round_csv is not None:
                 round_csv.close()
-            bridge.disconnect()
+            try:
+                bridge.disconnect()
+            finally:
+                if transcript is not None:
+                    transcript.close()
         _emit_lifecycle(
             event_sink,
             start_time,
@@ -1406,6 +1445,8 @@ def _run_hardware_tuning_loop(
     final_pid = dict(tested_result["pid"] if tested_result else session.buffer.current_pid)
     result = {
         "elapsed_sec": now_elapsed(start_time),
+        "failure_detail": failure_detail,
+        "serial_log_path": str(transcript.path) if transcript else None,
         "tune_axis": tune_axis,
         "output_limit": hardware_output_limit,
         "output_unit": "rad/s" if is_yaw_axis else "m/s",

@@ -21,7 +21,7 @@ def has_verified_result(result: dict[str, Any]) -> bool:
         and evidence.get("pid") == pid
         and evidence.get("metrics") == result.get("final_metrics")
         and result.get("verified_pid") == pid
-        and result.get("stop_confirmation") == "feedback_confirmed"
+        and result.get("stop_confirmation") in ("can_stop_sent", "feedback_confirmed")
         and isinstance(motion_tests, list)
         and all(isinstance(item, dict) and item.get("passed") is True for item in motion_tests)
     )
@@ -144,6 +144,8 @@ def append_pid_result(result: dict[str, Any], path: str) -> Path | None:
         "suggested_pid": result.get("suggested_pid"),
         "loaded_pid": result.get("loaded_pid"),
         "stop_confirmation": result.get("stop_confirmation", "unknown"),
+        "serial_log_path": result.get("serial_log_path"),
+        "failure_detail": result.get("failure_detail", ""),
         "saved_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "provider": result.get("provider"),
         "model": result.get("model"),

@@ -86,7 +86,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "REQUIRED_STABLE_ROUNDS"        : 3,
     "HARDWARE_STAGE_MAX_ROUNDS"     : 5,
     "HARDWARE_VERIFY_ROUNDS"        : 3,
-    "HARDWARE_RESUME_LAST_PID"      : False,
+    "HARDWARE_RESUME_LAST_PID"      : True,
     "HARDWARE_TUNE_AXIS"            : "X",
     "HARDWARE_INITIAL_PID_X"        : {"p": 0.00495, "i": 0.0, "d": 0.0},
     "HARDWARE_INITIAL_PID_Y"        : {"p": 0.0018, "i": 0.0, "d": 0.0},

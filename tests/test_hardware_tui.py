@@ -200,6 +200,8 @@ class HardwareTuiLoopTests(unittest.TestCase):
                     "MAX_TUNING_ROUNDS": 0,
                     "HARDWARE_TUNE_AXIS": "Y",
                     "HARDWARE_OUTPUT_LIMIT_MPS": 0.15,
+                    "HARDWARE_RESUME_LAST_PID": False,
+                    "HARDWARE_INITIAL_PID_X": {"p": 0.00495, "i": 0.0, "d": 0.0},
                 },
                 clear=False,
             ):
@@ -225,7 +227,7 @@ class HardwareTuiLoopTests(unittest.TestCase):
                 "STOP",
             ],
         )
-        self.assertEqual(sent_commands[-1], "MODE WORK")
+        self.assertNotIn("MODE WORK", sent_commands)
 
     def test_hardware_loop_emits_stream_and_decision_events(self):
         event_queue = Queue()
