@@ -61,7 +61,7 @@ def healthy_progress(before, after):
             return False
         for sample, stop in ((a, before["stop"]), (b, after["stop"])):
             if (int(sample["STATE"]) != 2 or int(sample["READY"]) != 1 or
-                    int(sample["TX_FAULT"]) != 0 or int(sample["ESR"], 0) & 4):
+                    int(sample["TX_FAULT"]) != 0 or int(sample["ESR"], 0) & 7):
                 return False
             if (stop.get("STATE") != "SENT" or stop.get("EVIDENCE") != "CAN_TX_ONLY" or
                     int(stop["MASK"], 0) != mask):

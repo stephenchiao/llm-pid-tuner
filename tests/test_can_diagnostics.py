@@ -24,6 +24,8 @@ class CanDiagnosticsTests(unittest.TestCase):
             lambda s: s["can"].update(READY="0"),
             lambda s: s["can"].update(TX_FAULT="1"),
             lambda s: s["can"].update(ESR="0x4"),
+            lambda s: s["can"].update(ESR="0x2"),
+            lambda s: s["can"].update(ESR="0x1"),
             lambda s: s["can"].update(TX_ERR="6"),
             lambda s: s["can"].update(TX_TIMEOUT="3"),
             lambda s: s["stop"].update(STATE="WAIT"),
@@ -33,9 +35,6 @@ class CanDiagnosticsTests(unittest.TestCase):
             after = sample(11)
             mutate(after)
             self.assertFalse(healthy_progress(sample(10), after))
-        warning = sample(11)
-        warning["can"]["ESR"] = "0x3"
-        self.assertTrue(healthy_progress(sample(10), warning))
 
     def test_checkpoint_timeout_cannot_succeed_when_can_unready(self):
         unready = sample(10)
