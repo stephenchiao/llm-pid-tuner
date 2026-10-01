@@ -124,8 +124,10 @@ class AdvancedDataBuffer:
             ) / len(hold_values)
         return out
 
-    def to_prompt_data(self, tune_axis: str | None = None, current_yaw_pid: Dict[str, float] | None = None) -> str:
-        metrics = self.calculate_advanced_metrics(tune_axis=tune_axis)
+    def to_prompt_data(self, tune_axis: str | None = None, current_yaw_pid: Dict[str, float] | None = None,
+                       round_metrics: Dict[str, Any] | None = None) -> str:
+        metrics = (round_metrics if round_metrics is not None
+                   else self.calculate_advanced_metrics(tune_axis=tune_axis))
 
         # 下采样：如果数据太多，每隔几个点取一个
         all_data     = list(self.buffer)
@@ -142,6 +144,11 @@ class AdvancedDataBuffer:
         lines.append(f"- 最大误差: {metrics.get('max_error', 0):.2f}")
         lines.append(f"- 超调量: {metrics.get('overshoot', 0):.1f}%")
         lines.append(f"- 稳态误差估算: {metrics.get('steady_state_error', 0):.2f}")
+        if "hardware_accepted" in metrics:
+            lines.append("- 注意：平均误差及最后20%误差包含运动/减速过程，不等于到位后的稳态误差。")
+            for key in ("round_stop_reason", "hardware_accepted", "first_in_tolerance_ms",
+                        "last_sample_ms", "speed_saturation_ratio", "current_error"):
+                lines.append(f"- {key}: {metrics.get(key)}")
         lines.append(
             f"- 震荡检测: 过零点 {metrics.get('zero_crossings', 0)} 次 (状态: {metrics.get('status', 'UNKNOWN')})"
         )
@@ -187,7 +194,7 @@ class AdvancedDataBuffer:
 
         for d in sampled_data:
             lines.append(
-                f"{d.get('timestamp', 0):.0f}, {d.get('input', 0):.2f}, {d.get('pwm', 0):.1f}, {d.get('error', 0):.2f}"
+                f"{d.get('timestamp', 0):.0f}, {d.get('input', 0):.2f}, {d.get('pwm', 0):.4f}, {d.get('error', 0):.2f}"
             )
 
         return "\n".join(lines)

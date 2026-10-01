@@ -96,8 +96,10 @@ def evaluate_completed_round(
     *,
     tune_axis: str | None = None,
     current_yaw_pid: dict[str, float] | None = None,
+    round_metrics: dict[str, Any] | None = None,
 ) -> RoundEvaluation:
-    metrics = state.buffer.calculate_advanced_metrics(tune_axis=tune_axis)
+    metrics = (dict(round_metrics) if round_metrics is not None
+               else state.buffer.calculate_advanced_metrics(tune_axis=tune_axis))
     round_index = state.round_num + 1
     # 检测重试：同一轮因 pause 被中断后重新进入，last_round 已等于 round_index
     is_retry = state.last_round == round_index

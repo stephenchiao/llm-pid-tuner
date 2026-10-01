@@ -54,6 +54,9 @@ class TuningHistory:
                 if len(t) > _MAX_THOUGHT_ANALYSIS_LEN:
                     t = t[:_MAX_THOUGHT_ANALYSIS_LEN].rstrip() + "..."
                 text += f"- **AI思考过程**: {t}\n"
+            if "applied_pid" in rec:
+                text += f"- **护栏后下一轮参数**: {rec['applied_pid']}；YAW={rec['applied_yaw_pid']}\n"
+                text += f"- **护栏反馈**: {'; '.join(rec['guardrail_notes']) or '无裁剪'}\n"
             if rec.get("analysis"):
                 a = rec["analysis"]
                 if len(a) > _MAX_THOUGHT_ANALYSIS_LEN:

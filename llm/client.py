@@ -564,7 +564,8 @@ class LLMTuner:
         system_prompt = (
             "你是PID调试记录员。根据给定的轮次指标和已执行的调参分析，"
             "简要总结调参过程并评价最终结果。不要输出思维链，不要建议超出安全限幅的参数，"
-            "不要把中断或失败会话评价为成功。仅输出JSON，字段必须为"
+            "不要把中断或失败会话评价为成功。failed_round和failure_detail为异常轮次证据，"
+            "必须说明具体停止原因，final_metrics仅代表最后完整轮次。字段必须为"
             "process_summary、evaluation、recommendation；每项不超过300个中文字符。"
         )
         user_prompt = json.dumps(session_data, ensure_ascii=False, default=str)

@@ -246,9 +246,9 @@ def yaw_coupling_penalty(metrics: Dict[str, float], tune_axis: str | None = None
 
 def score_metrics(metrics: Dict[str, float], tune_axis: str | None = None) -> float:
     """将控制表现压缩成一个可比较的分数，越低越好。"""
-    avg_error          = float(metrics.get("avg_error", 1e9) or 1e9)
-    steady_state_error = float(metrics.get("steady_state_error", 1e9) or 1e9)
-    overshoot          = float(metrics.get("overshoot", 1e9) or 1e9)
+    avg_error          = _to_float(metrics.get("avg_error"), 1e9)
+    steady_state_error = _to_float(metrics.get("steady_state_error"), 1e9)
+    overshoot          = _to_float(metrics.get("overshoot"), 1e9)
     status             = str(metrics.get("status", "UNKNOWN")).upper()
 
     status_penalty = 0.0
@@ -301,9 +301,13 @@ def is_good_enough(metrics: Dict[str, float], rules: Dict[str, float] | None = N
     """判断系统是否已经达到“用户可接受”的稳定状态。"""
     rules              = rules or DEFAULT_CONVERGENCE_RULES
     status             = str(metrics.get("status", "UNKNOWN")).upper()
-    avg_error          = float(metrics.get("avg_error", float("inf")) or float("inf"))
-    steady_state_error = float(metrics.get("steady_state_error", float("inf")) or float("inf"))
-    overshoot          = float(metrics.get("overshoot", float("inf")) or float("inf"))
+    # Hardware acceptance includes TARGET and axis/yaw constraints. Transient
+    # averages must not veto a completed point-to-point move.
+    if "hardware_accepted" in metrics:
+        return status == "STABLE" and metrics["hardware_accepted"] is True
+    avg_error          = _to_float(metrics.get("avg_error"), float("inf"))
+    steady_state_error = _to_float(metrics.get("steady_state_error"), float("inf"))
+    overshoot          = _to_float(metrics.get("overshoot"), float("inf"))
 
     return (
         status == "STABLE"
@@ -329,12 +333,12 @@ def should_rollback_to_best(
     if best_status == "STABLE" and current_status != "STABLE":
         return True
 
-    current_avg       = float(current_metrics.get("avg_error", 1e9) or 1e9)
-    best_avg          = float(best_metrics.get("avg_error", 1e9) or 1e9)
-    current_steady    = float(current_metrics.get("steady_state_error", 1e9) or 1e9)
-    best_steady       = float(best_metrics.get("steady_state_error", 1e9) or 1e9)
-    current_overshoot = float(current_metrics.get("overshoot", 1e9) or 1e9)
-    best_overshoot    = float(best_metrics.get("overshoot", 1e9) or 1e9)
+    current_avg       = _to_float(current_metrics.get("avg_error"), 1e9)
+    best_avg          = _to_float(best_metrics.get("avg_error"), 1e9)
+    current_steady    = _to_float(current_metrics.get("steady_state_error"), 1e9)
+    best_steady       = _to_float(best_metrics.get("steady_state_error"), 1e9)
+    current_overshoot = _to_float(current_metrics.get("overshoot"), 1e9)
+    best_overshoot    = _to_float(best_metrics.get("overshoot"), 1e9)
 
     avg_regression    = current_avg > max(best_avg * rules["avg_error_ratio"], best_avg + rules["avg_error_margin"])
     steady_regression = current_steady > max(

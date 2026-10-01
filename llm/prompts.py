@@ -117,7 +117,7 @@ _MODE_NOTES = {
 - 优先只调 P；确认响应稳定后再加入极小的 I，只有出现超调或振荡时才尝试小量 D。
 - 若输出已长时间达到模型上下文给出的速度限幅，增加 P 无法再提速，此时禁止增加 I，以免积分饱和。
 - normalized input 持续变为负值代表运动方向错误或底盘发散，必须终止调参，不能建议负 P。
-- 调参目标：在超调不超过 3%、稳态误差不超过 10 mm 的前提下缩短到位时间。
+- 调参目标：满足 TARGET、最终误差容差、超调和航向验收条件后固定参数验证；不为了继续缩短到位时间而增加增益。
 - 硬件调参器会通过 tuning stage 指明当前 P/I/D 阶段；只能修改 adjustable terms，frozen terms 必须原值返回。
 - 硬件模式下 status=DONE 表示“当前阶段已经调好”，调参器会自动进入下一阶段，并不代表整个流程立即结束。
 - I 或 D 没有改善空间时可以保持为 0，并用 DONE 结束当前阶段；禁止为了得到非零参数而强行增加 I 或 D。
@@ -125,6 +125,7 @@ _MODE_NOTES = {
 - 主轴目标与航向目标同时成立才算好：主轴误差小，且 yaw_delta_peak 不超过 yaw_peak_budget_deg。
 - 偏航超标或 hold 饱和时：禁止提高主轴 P；应小幅提高 YAW 的 P（yaw_p），或保持主轴并接受更长到位时间。
 - YAW 修正字段为可选：yaw_p / yaw_i / yaw_d（或嵌套 yaw_pid）。缺省表示保持当前 YAW hold 参数。
+- yaw_adjustment_allowed 为否时，YAW hold 参数必须保持当前值。
 - YAW 单轮增幅必须很小（约 1.2 倍以内）；不要为了压偏航而大幅修改 YAW 的 I/D。
 - 当前 YAW P 已接近实用上限时，优先降低主轴攻击性，而不是继续加 yaw_p。
 """.strip(),
@@ -146,6 +147,16 @@ def normalize_tuning_mode(mode: str | None) -> str:
 def get_system_prompt(mode: str | None = None) -> str:
     resolved_mode = normalize_tuning_mode(mode)
     mode_notes = _MODE_NOTES.get(resolved_mode, _MODE_NOTES["generic"])
+    if resolved_mode == "hardware":
+        return (
+            "你是负责真实底盘的 PID 调参工程师。只输出要求的 JSON。\n"
+            "按 P、必要时 I、必要时 D 的顺序调参，严格保持冻结参数。\n"
+            "目标是可靠到位：满足验收条件后固定参数验证，不继续追求最短时间。\n"
+            "整轮平均误差与最后20%误差包含加速和减速段，不能仅据此认定 P 太小。\n"
+            "必须遵守上下文 pid_limits；已被裁剪或无收益的方向不得重复。\n"
+            "对比实际应用参数与结果，不把上一轮建议当成已执行的参数。\n\n"
+            + mode_notes
+        )
     return f"{_BASE_SYSTEM_PROMPT}\n\n{mode_notes}"
 
 

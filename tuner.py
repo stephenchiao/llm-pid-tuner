@@ -21,6 +21,7 @@ import time
 import traceback
 from typing import Any, Callable
 
+from core.buffer import AdvancedDataBuffer
 from core.config import CONFIG, initialize_runtime_config, resolve_project_path
 from core.pid_results import (
     append_pid_result,
@@ -40,7 +41,7 @@ from hw.bridge import SerialBridge, safe_pause, select_serial_port, _is_demo_por
 from hw.session import can_start_round
 from hw.diagnostics import SerialTranscript, capture_failure, fields
 from llm.client import LLMTuner
-from pid_safety import build_fallback_suggestion, get_pid_limits
+from pid_safety import build_fallback_suggestion, get_pid_limits, pid_equals
 from sim.runtime import (
     EVENT_DECISION,
     EVENT_LIFECYCLE,
@@ -222,6 +223,7 @@ def _build_hardware_prompt_context(
 ) -> dict[str, Any]:
     axis = _normalize_hardware_axis(tune_axis or CONFIG.get("HARDWARE_TUNE_AXIS", "Y"))
     is_yaw = axis == "YAW"
+    limits = get_pid_limits("hardware_yaw" if is_yaw else "hardware")
     stage_terms = {
         "P": ("P", "I,D"),
         "I": ("I", "P,D"),
@@ -248,7 +250,9 @@ def _build_hardware_prompt_context(
         "adjustable_terms": adjustable,
         "frozen_terms": frozen,
         "done_meaning": "Current stage is complete; the host advances to the next stage.",
-        "per_round_guardrail_hint": "Keep P within about 3x the current value, and keep I/D within about 4x. Prefer smaller moves near stability.",
+        "pid_limits": limits,
+        "per_round_guardrail_hint": "P/I/D increases are limited to 1.5x per round and the absolute pid_limits. Do not repeat a clipped proposal.",
+        "acceptance_goal": "Reach TARGET within tolerance with acceptable overshoot and yaw. Once accepted, hold gains for verification; do not optimize speed indefinitely.",
         "yaw_hold_limit_radps": float(CONFIG.get("HARDWARE_YAW_HOLD_LIMIT_RADPS", 0.15) or 0.15),
         "yaw_peak_budget_deg": float(CONFIG.get("HARDWARE_YAW_SOFT_BUDGET_DEG", 5.0) or 5.0),
         "yaw_verify_limit_deg": float(CONFIG.get("HARDWARE_YAW_VERIFY_LIMIT_DEG", 8.0) or 8.0),
@@ -319,6 +323,31 @@ def _yaw_adjust_allowed(metrics: dict[str, Any], tune_axis: str, tuning_stage: s
     sat_ratio = float(metrics.get("hold_yaw_saturated_ratio", 0.0) or 0.0)
     sat_trigger = float(CONFIG.get("HARDWARE_YAW_ADJUST_SAT_RATIO", 0.25) or 0.25)
     return yaw_peak > budget or sat_ratio >= sat_trigger
+
+
+def _evaluate_hardware_metrics(
+    buffer: AdvancedDataBuffer, tune_axis: str, output_limit: float, stop_reason: str,
+) -> dict[str, Any]:
+    """Apply the same acceptance rules before scoring, rollback and verification."""
+    metrics = buffer.calculate_advanced_metrics(tune_axis=tune_axis)
+    samples = list(buffer.buffer)
+    _augment_hardware_round_metrics(
+        metrics, samples, output_limit=output_limit, stop_reason=stop_reason,
+    )
+    tolerance = 1.0 if tune_axis == "YAW" else 5.0
+    metrics["first_in_tolerance_ms"] = next(
+        (sample.get("timestamp") for sample in samples
+         if abs(float(sample["setpoint"]) - float(sample["input"])) <= tolerance),
+        None,
+    )
+    metrics["last_sample_ms"] = samples[-1].get("timestamp") if samples else None
+    metrics["response_status"] = metrics.get("status", "UNKNOWN")
+    metrics["hardware_accepted"] = _hardware_validation_passed(metrics, stop_reason, tune_axis)
+    if metrics["hardware_accepted"]:
+        metrics["status"] = "STABLE"
+    elif metrics.get("status") == "STABLE":
+        metrics["status"] = "CONSTRAINT_VIOLATION"
+    return metrics
 
 
 class RoundAdmissionClosed(Exception):
@@ -554,7 +583,28 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable the Textual dashboard and use plain console logs.",
     )
+    parser.add_argument(
+        "--axes",
+        nargs="+",
+        help="Tune X, Y or YAW in the supplied order, e.g. --axes X Y YAW.",
+    )
     return parser
+
+
+def parse_hardware_axes(value: str) -> list[str]:
+    """Validate the entire selection before opening hardware; deduplicate in order."""
+    tokens = re.split(r"[\s,/;，、；]+", value.strip().upper())
+    axes: list[str] = []
+    for axis in tokens:
+        if not axis:
+            continue
+        if axis not in {"X", "Y", "YAW"}:
+            raise ValueError(f"无效轴 {axis!r}，只能输入 X、Y、YAW。")
+        if axis not in axes:
+            axes.append(axis)
+    if not axes:
+        raise ValueError("请至少输入一个轴：X、Y 或 YAW。")
+    return axes
 
 
 def resolve_serial_port(serial_port_arg: str | None) -> str | None:
@@ -630,6 +680,7 @@ def _run_hardware_tuning_loop(
     controller: SimulationController | None = None,
     emit_console: bool = True,
     initial_pid: dict[str, float] | None = None,
+    preserved_pids: dict[str, dict[str, float]] | None = None,
 ) -> dict[str, Any]:
     tune_axis = _normalize_hardware_axis(CONFIG.get("HARDWARE_TUNE_AXIS", "Y"))
     is_yaw_axis = tune_axis == "YAW"
@@ -748,6 +799,8 @@ def _run_hardware_tuning_loop(
     loaded_pid = None
     stop_confirmation = "not_requested"
     failure_detail = ""
+    failed_round = None
+    unchanged_proposals = 0
 
     def start_next(pid, yaw=None, previous_yaw=None):
         if controller is not None and controller.is_paused:
@@ -817,8 +870,10 @@ def _run_hardware_tuning_loop(
         for saved_axis in ("X", "Y", "YAW"):
             if saved_axis == tune_axis:
                 continue
-            saved_pid = None
-            if bool(CONFIG.get("HARDWARE_RESUME_LAST_PID", False)):
+            # Earlier axes in this launch take precedence over history/config,
+            # including when resume is disabled or saving the result log failed.
+            saved_pid = (preserved_pids or {}).get(saved_axis)
+            if saved_pid is None and bool(CONFIG.get("HARDWARE_RESUME_LAST_PID", False)):
                 saved_mode = "hardware_yaw" if saved_axis == "YAW" else "hardware"
                 saved_pid = load_last_usable_pid(
                     result_log, get_pid_limits(saved_mode), saved_axis
@@ -980,6 +1035,13 @@ def _run_hardware_tuning_loop(
                         else:
                             session.completed_reason = "hardware_stopped"
                             failure_detail = line
+                            failed_round = {
+                                "round": session.round_num + 1,
+                                "stop_reason": stop_payload,
+                                "pid": dict(session.buffer.current_pid),
+                                "metrics": _evaluate_hardware_metrics(
+                                    session.buffer, tune_axis, hardware_output_limit, stop_reason),
+                            }
                             _console(
                                 emit_console,
                                 f"[ERROR] 主控异常停止本轮：{line}",
@@ -1097,12 +1159,8 @@ def _run_hardware_tuning_loop(
                 dict(session.buffer.current_pid),
                 tune_axis=tune_axis,
                 current_yaw_pid=session.current_yaw_pid,
-            )
-            _augment_hardware_round_metrics(
-                evaluation.metrics,
-                list(session.buffer.buffer),
-                output_limit=hardware_output_limit,
-                stop_reason=round_stop_reason,
+                round_metrics=_evaluate_hardware_metrics(
+                    session.buffer, tune_axis, hardware_output_limit, round_stop_reason),
             )
             session.last_metrics.update(evaluation.metrics)
             tested_result = {"round": evaluation.round_index, "axis": tune_axis,
@@ -1137,6 +1195,12 @@ def _run_hardware_tuning_loop(
                     f"P={evaluation.best_result['pid']['p']}, I={evaluation.best_result['pid']['i']}, D={evaluation.best_result['pid']['d']}",
                 )
                 _emit_log(event_sink, start_time, "best", best_message)
+
+            if tuning_stage != "VERIFY" and evaluation.metrics["hardware_accepted"]:
+                tuning_stage = "VERIFY"
+                verification_passes = 0
+                unchanged_proposals = 0
+                _console(emit_console, "[Stage] 当前参数已满足到位约束，固定 PID 进入重复验证")
 
             if tuning_stage == "VERIFY":
                 passed = _hardware_validation_passed(
@@ -1174,17 +1238,20 @@ def _run_hardware_tuning_loop(
                     if verification_passes >= required_verification_rounds:
                         session.completed_reason = "staged_validation_passed"
                         tested_result["verified"] = True
-                        _console(emit_console, "\n[SUCCESS] P、I、D 分阶段调参及最终验证完成！")
+                        _console(emit_console, "\n[SUCCESS] 当前 PID 已通过连续到位验证！")
                         _emit_lifecycle(
                             event_sink,
                             start_time,
                             "completed",
-                            "P/I/D staged tuning passed final verification.",
+                            "PID passed consecutive hardware verification rounds.",
                         )
                         break
                 else:
                     verification_passes = 0
-                    if float(evaluation.metrics.get("steady_state_error", 0.0)) > hardware_steady_error_limit:
+                    if _yaw_adjust_allowed(evaluation.metrics, tune_axis, "P"):
+                        tuning_stage = "P"
+                        _console(emit_console, "[Stage] 验证未通过：返回 P 阶段处理航向约束")
+                    elif float(evaluation.metrics.get("current_error", 0.0)) > (1.0 if is_yaw_axis else 5.0):
                         tuning_stage = "I"
                         _console(emit_console, "[Stage] 验证未通过：返回 I 阶段处理稳态误差")
                     else:
@@ -1261,6 +1328,7 @@ def _run_hardware_tuning_loop(
             prompt_data = session.buffer.to_prompt_data(
                 tune_axis=tune_axis,
                 current_yaw_pid=session.current_yaw_pid,
+                round_metrics=evaluation.metrics,
             )
             history_text = session.history.to_prompt_text()
             current_stream_round[0] = evaluation.round_index
@@ -1274,9 +1342,12 @@ def _run_hardware_tuning_loop(
                 prompt_data,
                 history_text,
                 tuning_mode="hardware",
-                prompt_context=_build_hardware_prompt_context(
-                    serial_port, tuning_stage, hardware_output_limit, tune_axis
-                ),
+                prompt_context={
+                    **_build_hardware_prompt_context(
+                        serial_port, tuning_stage, hardware_output_limit, tune_axis),
+                    "yaw_adjustment_allowed": _yaw_adjust_allowed(
+                        evaluation.metrics, tune_axis, tuning_stage),
+                },
             )
 
             if not result:
@@ -1304,6 +1375,12 @@ def _run_hardware_tuning_loop(
             allow_yaw_edit = _yaw_adjust_allowed(
                 evaluation.metrics, tune_axis, tuning_stage
             )
+            yaw_blocks_increase = (
+                allow_yaw_edit
+                and float(result.get("p", evaluation.current_pid["p"])) > evaluation.current_pid["p"]
+            )
+            if yaw_blocks_increase:
+                result["p"] = evaluation.current_pid["p"]
             previous_yaw = dict(session.current_yaw_pid or {})
             decision = finalize_decision(
                 session,
@@ -1319,6 +1396,10 @@ def _run_hardware_tuning_loop(
                 current_yaw_pid=session.current_yaw_pid,
                 allow_yaw_adjust=allow_yaw_edit,
             )
+            if yaw_blocks_increase:
+                if not decision.guardrail_notes:
+                    session.guardrail_count += 1
+                decision.guardrail_notes.append("偏航超预算或 hold 饱和，禁止提高主轴 P")
             publish_event(
                 event_sink,
                 EVENT_DECISION,
@@ -1344,6 +1425,20 @@ def _run_hardware_tuning_loop(
                 _console(emit_console, f"[Guardrail] {'; '.join(decision.guardrail_notes)}")
             if decision.fallback_used:
                 _console(emit_console, "[Fallback] 本轮使用规则策略替代 LLM 建议。")
+
+            unchanged = (pid_equals(decision.safe_pid, evaluation.current_pid)
+                         and pid_equals(decision.safe_yaw_pid or {}, previous_yaw))
+            unchanged_proposals = unchanged_proposals + 1 if unchanged and decision.status != "DONE" else 0
+            if session.history.history:
+                session.history.history[-1].update(
+                    applied_pid=dict(decision.safe_pid),
+                    applied_yaw_pid=dict(decision.safe_yaw_pid or {}),
+                    guardrail_notes=list(decision.guardrail_notes),
+                )
+            if unchanged_proposals >= 2:
+                session.completed_reason = "no_parameter_progress"
+                _console(emit_console, "[STOP] 连续两轮建议经护栏处理后参数不变且未达标，停止无效重复调参")
+                break
 
             stage_rounds += 1
             stage_finished = (
@@ -1446,6 +1541,7 @@ def _run_hardware_tuning_loop(
     result = {
         "elapsed_sec": now_elapsed(start_time),
         "failure_detail": failure_detail,
+        "failed_round": failed_round,
         "serial_log_path": str(transcript.path) if transcript else None,
         "tune_axis": tune_axis,
         "output_limit": hardware_output_limit,
@@ -1479,6 +1575,8 @@ def _run_hardware_tuning_loop(
         "tune_axis": tune_axis,
         "rounds_completed": result["rounds_completed"],
         "completed_reason": result["completed_reason"],
+        "failure_detail": failure_detail,
+        "failed_round": failed_round,
         "final_pid": final_pid,
         "pid_snapshot": pid_snapshot,
         "output_limit": hardware_output_limit,
@@ -1504,6 +1602,7 @@ def _run_hardware_tuning_loop(
 def _run_hardware_tuning_with_tui(
     serial_port: str,
     initial_pid: dict[str, float] | None = None,
+    preserved_pids: dict[str, dict[str, float]] | None = None,
 ) -> dict[str, Any]:
     from sim.tui import SimulationTUIApp
 
@@ -1521,6 +1620,7 @@ def _run_hardware_tuning_with_tui(
                 controller=app.controller,
                 emit_console=False,
                 initial_pid=pid,
+                preserved_pids=preserved_pids,
             )
             result_box["result"] = result
             app._last_result = result
@@ -1547,6 +1647,7 @@ def _run_hardware_tuning_with_tui(
 def _run_hardware_tuning_plain(
     serial_port: str,
     initial_pid: dict[str, float] | None = None,
+    preserved_pids: dict[str, dict[str, float]] | None = None,
 ) -> dict[str, Any]:
     print("=" * 60)
     print("  LLM PID Tuner PRO - 增强版自动调参系统")
@@ -1556,6 +1657,7 @@ def _run_hardware_tuning_plain(
         serial_port,
         emit_console=True,
         initial_pid=initial_pid,
+        preserved_pids=preserved_pids,
     )
 
 
@@ -1563,8 +1665,21 @@ def run_hardware_tuner(
     serial_port_arg: str | None = None,
     force_plain: bool = False,
     initial_pid: dict[str, float] | None = None,
+    *,
+    tune_axis: str | None = None,
+    preserved_pids: dict[str, dict[str, float]] | None = None,
 ) -> dict[str, Any]:
+    if tune_axis is not None:
+        selected = parse_hardware_axes(tune_axis)
+        if len(selected) != 1:
+            raise ValueError("单次调参只能指定一个轴。")
+        tune_axis = selected[0]
     initialize_runtime_config(create_if_missing=True, verbose=True)
+    if tune_axis is not None:
+        CONFIG["HARDWARE_TUNE_AXIS"] = tune_axis
+        # An explicit axis selection adjusts only that axis; yaw hold stays active
+        # with fixed gains during X/Y tuning.
+        CONFIG["HARDWARE_YAW_COPILOT"] = False
     serial_port = resolve_serial_port(serial_port_arg)
     if not serial_port:
         print("[ERROR] 未指定串口，程序退出。")
@@ -1594,16 +1709,19 @@ def run_hardware_tuner(
             )
 
     result: dict[str, Any]
+    runner_kwargs: dict[str, Any] = {"initial_pid": initial_pid}
+    if preserved_pids is not None:
+        runner_kwargs["preserved_pids"] = preserved_pids
     if not force_plain:
         try:
-            result = _run_hardware_tuning_with_tui(serial_port, initial_pid=initial_pid)
+            result = _run_hardware_tuning_with_tui(serial_port, **runner_kwargs)
         except Exception as exc:
             print(f"[WARN] Failed to start the TUI ({exc}); falling back to plain output.")
             if bool(CONFIG.get("LLM_DEBUG_OUTPUT")):
                 traceback.print_exc()
-            result = _run_hardware_tuning_plain(serial_port, initial_pid=initial_pid)
+            result = _run_hardware_tuning_plain(serial_port, **runner_kwargs)
     else:
-        result = _run_hardware_tuning_plain(serial_port, initial_pid=initial_pid)
+        result = _run_hardware_tuning_plain(serial_port, **runner_kwargs)
 
     try:
         saved_path = append_pid_result(
@@ -1622,9 +1740,57 @@ def run_hardware_tuner(
     return result
 
 
+def _axis_tuning_succeeded(result: dict[str, Any]) -> bool:
+    return (
+        result.get("completed_reason") == "staged_validation_passed"
+        and isinstance(result.get("verified_pid"), dict)
+        and all(key in result["verified_pid"] for key in ("p", "i", "d"))
+        and not result.get("failure_detail")
+        and not result.get("stopped")
+        and result.get("stop_confirmation") in {"command_sent", "can_stop_sent"}
+        and all(item.get("passed") for item in result.get("motion_tests", []))
+    )
+
+
+def run_hardware_axis_sequence(
+    axes: list[str], serial_port_arg: str | None = None, force_plain: bool = False,
+) -> list[dict[str, Any]]:
+    axes = parse_hardware_axes(" ".join(axes))
+    results: list[dict[str, Any]] = []
+    preserved_pids: dict[str, dict[str, float]] = {}
+    print(f"[INFO] 本次调参顺序：{' -> '.join(axes)}")
+    for index, axis in enumerate(axes, start=1):
+        print(f"\n[INFO] 开始调试 {axis} 轴 ({index}/{len(axes)})")
+        result = run_hardware_tuner(
+            serial_port_arg, force_plain=force_plain,
+            tune_axis=axis, preserved_pids=dict(preserved_pids),
+        )
+        results.append(result)
+        if not _axis_tuning_succeeded(result):
+            print(
+                f"[WARN] {axis} 轴未正常完成："
+                f"{result.get('completed_reason', 'unknown')}。停止后续轴调参。"
+            )
+            break
+        preserved_pids[axis] = dict(result["verified_pid"])
+        print(f"[INFO] {axis} 轴调参完成。")
+    return results
+
+
 def main(argv: list[str] | None = None) -> None:
-    args = build_parser().parse_args(argv)
-    run_hardware_tuner(args.serial_port, force_plain=args.plain)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.axes is None:
+        run_hardware_tuner(args.serial_port, force_plain=args.plain)
+        return
+    try:
+        axes = parse_hardware_axes(" ".join(args.axes))
+    except ValueError as exc:
+        parser.error(str(exc))
+    results = run_hardware_axis_sequence(axes, args.serial_port, force_plain=args.plain)
+    if len(results) != len(axes) or not all(_axis_tuning_succeeded(r) for r in results):
+        raise SystemExit(1)
+    print(f"[INFO] 所选轴全部调参完成：{' -> '.join(axes)}")
 
 
 if __name__ == "__main__":

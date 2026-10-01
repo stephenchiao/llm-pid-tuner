@@ -52,6 +52,8 @@ def build_local_tuning_summary(
     )
     if analyses:
         process += "最近一轮分析：" + analyses[-1][:240]
+    if result.get("failure_detail"):
+        process += "异常停止：" + str(result["failure_detail"])
 
     metric_parts: list[str] = []
     for key, label in (
@@ -68,7 +70,10 @@ def build_local_tuning_summary(
     passed = has_verified_result(result)
     evaluation = "调参和验证已完成" if passed else "本次会话未形成可自动复用的可靠结果"
     if metric_parts:
-        evaluation += "；" + "，".join(metric_parts)
+        evaluation += "；最后完整轮次：" + "，".join(metric_parts)
+    if result.get("failed_round"):
+        failed = result["failed_round"]
+        evaluation += f"；第{failed['round']}轮异常停止={failed['stop_reason']}，未通过验证"
     recommendation = (
         "保存该组参数，并在正反方向、不同载荷和连续运行条件下复验。"
         if passed
@@ -146,6 +151,7 @@ def append_pid_result(result: dict[str, Any], path: str) -> Path | None:
         "stop_confirmation": result.get("stop_confirmation", "unknown"),
         "serial_log_path": result.get("serial_log_path"),
         "failure_detail": result.get("failure_detail", ""),
+        "failed_round": result.get("failed_round"),
         "saved_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "provider": result.get("provider"),
         "model": result.get("model"),

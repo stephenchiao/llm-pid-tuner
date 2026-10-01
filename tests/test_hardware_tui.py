@@ -390,13 +390,14 @@ class HardwareTuiLoopTests(unittest.TestCase):
                 self._pid = {"p": float(fields[0]), "i": float(fields[1]), "d": float(fields[2])}
                 self._round += 1
                 p, i, d = self._pid["p"], self._pid["i"], self._pid["d"]
+                stop_reason = "TIMEOUT" if self._round <= 3 else "TARGET"
                 self._lines.extend(
                     [
                         f"# ROUND START {self._round} DIR 1",
                         f"0,200,180,0.05,20,{p},{i},{d}",
                         f"20,200,198,0.01,2,{p},{i},{d}",
                         f"40,200,200,0.0,0,{p},{i},{d}",
-                        "# ROUND STOP TARGET",
+                        f"# ROUND STOP {stop_reason}",
                     ]
                 )
 
